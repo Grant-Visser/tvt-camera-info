@@ -11,6 +11,7 @@ import socket
 import struct
 import threading
 import unittest
+import unittest.mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import tvt_camera_info as T
@@ -93,6 +94,48 @@ class LogicTests(unittest.TestCase):
         self.assertTrue(T._is_auth_failure({"Body": {"Ret": "false"}}))
         self.assertTrue(T._is_auth_failure({"Body": {"Error": "bad login"}}))
         self.assertFalse(T._is_auth_failure({"Body": {"Ret": "true"}}))
+
+    def test_is_valid_ipv4(self):
+        self.assertTrue(T.is_valid_ipv4("192.168.1.64"))
+        self.assertTrue(T.is_valid_ipv4("10.0.0.1"))
+        self.assertFalse(T.is_valid_ipv4("999.1.1.1"))
+        self.assertFalse(T.is_valid_ipv4("10.0.0.256"))
+        self.assertFalse(T.is_valid_ipv4("banana"))
+        self.assertFalse(T.is_valid_ipv4(""))
+
+
+# ── Ping preflight tests ──────────────────────────────────────────────────
+
+class PingPreflightTests(unittest.TestCase):
+
+    def test_ping_loopback_alive(self):
+        alive, detail = T.ping_host("127.0.0.1", 2.0)
+        self.assertTrue(alive)
+        self.assertIn("ICMP", detail)
+
+    def test_ping_dead_ip(self):
+        # TEST-NET-1 never answers; subprocess still runs.
+        alive, detail = T.ping_host("192.0.2.123", 1.0)
+        self.assertFalse(alive)
+        self.assertTrue(detail)
+
+    def test_tcp_fallback_when_icmp_unavailable(self):
+        # ICMP "blocked" (ping binary unusable) but a DVRIP port is open → alive
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        try:
+            with unittest.mock.patch.object(T.subprocess, "run",
+                                            side_effect=OSError("blocked")), \
+                 unittest.mock.patch.object(T, "DVRIP_HTTP_PORT", port):
+                alive, detail = T.ping_host("127.0.0.1", 2.0)
+            self.assertTrue(alive)
+            self.assertIn("ICMP blocked", detail)
+            self.assertIn(str(port), detail)
+        finally:
+            srv.close()
 
 
 # ── Mock HTTP server (DVRIP over port 80) ─────────────────────────────────────

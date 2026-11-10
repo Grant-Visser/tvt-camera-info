@@ -70,6 +70,64 @@ def md5_upper(s: str) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest().upper()
 
 
+def is_valid_ipv4(ip: str) -> bool:
+    """True when ip is a dotted-quad IPv4 address."""
+    try:
+        socket.inet_aton(ip)
+        parts = ip.split(".")
+        return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255
+                                       for p in parts)
+    except (OSError, ValueError):
+        return False
+
+
+def ping_host(ip: str, timeout: float) -> "tuple[bool, str]":
+    """
+    Single ICMP ping before any auth is attempted.
+    Returns (alive, detail). detail is a human-readable line either way.
+    Uses the OS ping binary so no raw sockets/admin rights are needed;
+    falls back to a TCP connect check on the DVRIP ports when ICMP is
+    blocked (common on Windows firewalls and camera VLANs).
+    """
+    count = "-n" if sys.platform.startswith("win") else "-c"
+    wait = "-w" if sys.platform.startswith("win") else "-W"
+    # Windows -w is milliseconds; nix -W is seconds
+    wait_arg = str(int(timeout * 1000)) if sys.platform.startswith("win") \
+        else str(max(1, int(timeout)))
+    cmd = ["ping", count, "1", wait, wait_arg, ip]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout + 5)
+    except (OSError, subprocess.TimeoutExpired):
+        alive, detail = False, "ping could not run or timed out"
+    else:
+        out = (proc.stdout or "") + (proc.stderr or "")
+        alive = proc.returncode == 0
+        m = re.search(r"time[=<]([\d.]+)\s*ms", out)
+        rtt = f", {m.group(1)} ms" if m else ""
+        if alive:
+            detail = f"host answered ICMP echo (1 packet{rtt})"
+        elif "unreachable" in out.lower():
+            detail = "host unreachable (no route / wrong VLAN?)"
+        elif "timed out" in out.lower() or "100%" in out:
+            detail = "no ICMP reply (host down, or ICMP blocked)"
+        else:
+            detail = f"no ICMP reply (ping exit {proc.returncode})"
+
+    if alive:
+        return True, detail
+
+    # ICMP blocked ≠ camera absent: try a TCP connect on the DVRIP ports.
+    for port in (DVRIP_HTTP_PORT, DVRIP_TCP_PORT):
+        try:
+            with socket.create_connection((ip, port), timeout=timeout):
+                return True, (f"ICMP blocked, but TCP port {port} is open — "
+                              f"camera is up (ping is just firewalled)")
+        except OSError:
+            continue
+    return False, detail
+
+
 def dvr_login_body(user: str, password: str) -> dict:
     """DVRIP login frame (MsgID 766). Password is MD5-hex-uppercase, never plaintext."""
     return {"Version": "2.0", "SessionID": "0x0", "RequestType": 0,
@@ -564,14 +622,37 @@ def main() -> None:
                         "(default: auto)")
     p.add_argument("--timeout", type=float, default=TIMEOUT_DEFAULT,
                    help="network timeout in seconds (default: 8)")
+    p.add_argument("--no-ping", action="store_true",
+                   help="skip the initial ICMP reachability check")
     args = p.parse_args()
 
     order = ["http", "tcp", "onvif"] if args.proto == "auto" else [args.proto]
+
+    if not is_valid_ipv4(args.ip):
+        die(f"'{args.ip}' doesn't look like an IPv4 address — pass the camera's IP, "
+            f"e.g. --ip 192.168.1.64", EXIT_UNEXPECTED)
     failures: "list[str]" = []
     failure_kinds: "list[str]" = []
 
     print(f"Querying camera at {args.ip} — protocol(s): "
           f"{', '.join(PROTO_NAMES[o] for o in order)}\n")
+
+    # ── Step 0: reachability ping (before any auth is attempted) ────────────
+    if not args.no_ping:
+        print(f"  pinging {args.ip}...", flush=True)
+        alive, detail = ping_host(args.ip, args.timeout)
+        print(f"  {'✓' if alive else '✗'} ping: {detail}\n", flush=True)
+        if not alive:
+            print("=" * 60)
+            print(" CAMERA DID NOT RESPOND TO PING")
+            print("=" * 60)
+            print("  The tool has not tried any login yet. First fix reachability:")
+            print("  1. Confirm the camera is powered on and connected (link LED).")
+            print("  2. Check your PC is on the same network/VLAN as the camera.")
+            print("  3. Verify the IP — wrong address is the most common cause.")
+            print("  4. Re-run, or skip this check with --no-ping.")
+            print("=" * 60)
+            sys.exit(EXIT_NO_ROUTE)
 
     info = mac = label = None
     for proto in order:
