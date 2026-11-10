@@ -59,6 +59,10 @@ class UnexpectedError(Exception):
     pass
 
 
+class AmbiguousAuthError(Exception):
+    """Login reply could be a rejection or just a terse session grant."""
+
+
 # ── DVRIP framing ─────────────────────────────────────────────────────────────
 
 def md5_upper(s: str) -> str:
@@ -190,11 +194,25 @@ def _is_auth_failure(obj) -> bool:
         return False
     body = obj.get("Body") or {}
     if isinstance(body, dict):
-        if str(body.get("Ret")).lower() in ("false", "fail", "0"):
+        if str(body.get("Ret")).strip().lower() in ("false", "fail"):
+            return True
+        if str(body.get("Ret")).strip() == "0" and not _is_positive_login(obj):
             return True
         if body.get("Error") or body.get("Reason"):
             return True
     return False
+
+
+def _is_positive_login(obj) -> bool:
+    """True only when the reply carries a real session id."""
+    if not isinstance(obj, dict):
+        return False
+    s = _session_from([obj])
+    if not s:
+        return False
+    if str(s).strip().lower() in ("0x0", "0", "null", "none", ""):
+        return False
+    return True
 
 
 def _http_post_json(url: str, frame: bytes, timeout: float,
@@ -274,8 +292,21 @@ def dvrip_http_query(ip: str, port: int, user: str, password: str,
             reply = json.loads(raw.decode("utf-8", errors="replace"))
         except ValueError:
             raise RouteError("camera answer was not valid DVRIP JSON") from None
-        if _is_auth_failure(reply):
+        body = reply.get("Body") if isinstance(reply, dict) else None
+        ret_code = body.get("Ret") if isinstance(body, dict) else None
+        ret_norm = str(ret_code).strip().lower() if ret_code is not None else ""
+
+        success_ret = (ret_code == 0 and ret_code is not False) \
+            or ret_norm in ("true", "ok")
+        if success_ret and _is_positive_login(reply):
+            pass  # terse success: harmless Ret plus a real session id
+        elif isinstance(ret_code, (int, float)) and not isinstance(ret_code, bool) \
+                and ret_code != 0:
+            raise AuthError("camera rejected the login (numeric Ret=%s)" % ret_code)
+        elif _is_auth_failure(reply):
             raise AuthError("camera rejected the login (bad username/password)")
+        else:
+            raise AmbiguousAuthError(json.dumps(reply)[:200])
         session = headers.get("SessionID") or _session_from([reply]) or "0x0"
         info = extract_device_info(reply)
 
@@ -285,7 +316,7 @@ def dvrip_http_query(ip: str, port: int, user: str, password: str,
             raw2, _ = _http_post_json(url, qframe, timeout, session_id=session)
             info2 = extract_device_info(json.loads(raw2.decode("utf-8", errors="replace")))
             info.update(info2)
-        except (AuthError, RouteError, UnexpectedError, ValueError):
+        except (AuthError, RouteError, UnexpectedError, ValueError, OSError):
             pass  # probe is best-effort; login reply fields already captured
 
         # Logout
@@ -357,8 +388,21 @@ def dvrip_tcp_query(ip: str, port: int, user: str, password: str,
     try:
         send(dvr_login_body(user, password))
         reply = recv_reply()
-        if _is_auth_failure(reply):
+        body = reply.get("Body") if isinstance(reply, dict) else None
+        ret_code = body.get("Ret") if isinstance(body, dict) else None
+        ret_norm = str(ret_code).strip().lower() if ret_code is not None else ""
+
+        success_ret = (ret_code == 0 and ret_code is not False) \
+            or ret_norm in ("true", "ok")
+        if success_ret and _is_positive_login(reply):
+            pass
+        elif isinstance(ret_code, (int, float)) and not isinstance(ret_code, bool) \
+                and ret_code != 0:
             raise AuthError("camera rejected the login (bad username/password)")
+        elif _is_auth_failure(reply):
+            raise AuthError("camera rejected the login (bad username/password)")
+        else:
+            raise AmbiguousAuthError(json.dumps(reply)[:200])
         session = _session_from([reply]) or "0x0"
         info = extract_device_info(reply)
 
@@ -496,6 +540,9 @@ def _run_proto(proto: str, ip: str, port: int, user: str, password: str,
         return info, None, label, "ok"
     except AuthError as e:
         return None, f"auth: {e}", label, "auth"
+    except AmbiguousAuthError as e:
+        return None, (f"auth-ambiguous: camera replied with a terse frame this tool "
+                      f"can't classify — reply started with: {e}"), label, "auth"
     except RouteError as e:
         return None, f"unreachable: {e}", label, "route"
     except UnexpectedError as e:
@@ -549,7 +596,9 @@ def main() -> None:
         print("  1. Can't reach the camera → check it is powered on and your PC is on")
         print("     the same network/VLAN; verify the IP with a ping.")
         print("  2. Auth failed → the DVRIP/ONVIF password is wrong. Out of the box")
-        print("     these cameras often use admin / admin or admin / (empty).")
+        print("     these cameras often use admin / admin or admin / (empty). If your")
+        print("     password has special characters and works on the web UI but not here,")
+        print("     capture the reply shown above and send it to the tool maintainer.")
         print("  3. All protocols unavailable → DVRIP/ONVIF may be switched off in the")
         print("     camera's web UI (Network/System settings). Enable a protocol and")
         print("     re-run.")
