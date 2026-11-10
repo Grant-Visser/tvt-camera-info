@@ -136,7 +136,8 @@ Querying camera at 192.168.1.64 — protocol(s): DVRIP over HTTP, DVRIP over TCP
 | Message | What it means | How to fix |
 |---|---|---|
 | `connection timed out` / `could not connect` (all three protocols) | The PC couldn't reach the camera at that IP | Camera powered on? Your PC on the **same network** (same office/site, not on guest Wi-Fi)? IP correct? Try `ping <ip>` |
-| `camera rejected the login` / `authentication failed` | Wrong username or password | Out-of-the-box cameras often use `admin` with an **empty password** or `admin`. Check with whoever set it up |
+| `camera rejected the login` / `authentication failed` | Wrong username or password | Out-of-the-box cameras often use `admin` with an **empty password** or `admin`. Check with whoever set it up. Special characters (`#`, `@`, spaces…) are safe — the password is hashed before it's sent; quote it on the command line: `--password "YourPassword!"` |
+| `auth-ambiguous: … reply started with: {json}` | The camera answered with a terse frame this tool can't classify (often a nonstandard firmware) | Copy the shown JSON and send it to the tool maintainer — it says exactly what the camera replied |
 | `camera answer was not valid DVRIP JSON` | Something else answered on that port (not a TVT camera, or a protocol mismatch) | Double-check the IP is the camera's; try `--proto onvif` or a different port |
 | All three protocols fail but the camera is definitely reachable | DVRIP **and** ONVIF are both switched off | Log into the camera's web UI → Network / System settings → enable **DVRIP** and/or **ONVIF**; then re-run |
 | `did not report a serial number` | The camera answered but didn't give a serial | Check the sticker on the camera, or its web UI's Info/Version page |
