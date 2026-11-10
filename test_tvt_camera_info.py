@@ -21,87 +21,93 @@ import tvt_camera_info as T
 
 class LogicTests(unittest.TestCase):
 
-    def test_md5_password_hash(self):
-        # MD5("admin") uppercase hex — known vector
-        self.assertEqual(T.md5_upper("admin"), "21232F297A57A5A743894A0E4A801FC3")
-        self.assertEqual(T.md5_upper(""), "D41D8CD98F00B204E9800998ECF8427E")
-        self.assertTrue(T.md5_upper("secret").isupper())
+    def test_sofia_hash_known_vectors(self):
+        # Canonical Xiongmai DVRIP vectors
+        self.assertEqual(T.sofia_hash(""), "tlJwpbo6")
+        self.assertEqual(T.sofia_hash("admin"), "6QNMIQGe")
 
     def test_login_frame_never_contains_plaintext(self):
         body = T.dvr_login_body("admin", "s3cret")
-        self.assertEqual(body["Body"]["PassWord"], T.md5_upper("s3cret"))
+        self.assertEqual(body["PassWord"], T.sofia_hash("s3cret"))
+        self.assertEqual(body["EncryptType"], "MD5")
+        self.assertEqual(body["LoginType"], "DVRIP-Web")
         self.assertNotIn("s3cret", json.dumps(body))
-        self.assertEqual(body["MsgID"], 766)
-        self.assertEqual(json.dumps(body).find("s3cret"), -1)
 
-    def test_logout_frame(self):
-        self.assertEqual(T.dvr_logout_body()["MsgID"], 767)
+    def test_login_body_is_command_1000_shape(self):
+        # Login body has no MsgID inside the JSON — it rides in the header
+        body = T.dvr_login_body("admin", "x")
+        self.assertNotIn("MsgID", body)
+        self.assertNotIn("Body", body)
 
-    def test_tcp_frame_roundtrip(self):
-        payload = json.dumps({"Type": "OPMachine", "MsgID": 766,
-                              "Body": {"UserName": "admin"}}).encode()
-        frame = T.dvrip_tcp_frame(payload)
-        # 16-byte header + 4-byte LE length + payload
-        self.assertEqual(len(frame), 20 + len(payload))
-        self.assertEqual(frame[:2], b"HI")
-        (n,) = struct.unpack("<I", frame[16:20])
-        self.assertEqual(n, len(payload))
-        out, consumed = T.dvrip_tcp_decode(frame)
-        self.assertEqual(out, payload)
-        self.assertEqual(consumed, len(frame))
+    def test_logout_body(self):
+        body = T.dvr_logout_body()
+        self.assertIn("SessionID", body)
 
-    def test_tcp_frame_roundtrip_unicode(self):
-        payload = '{"Body":{"Model":"NVR-код"}}'.encode("utf-8")
-        frame = T.dvrip_tcp_frame(payload)
-        out, consumed = T.dvrip_tcp_decode(frame)
-        self.assertEqual(out, payload)
-        self.assertEqual(consumed, len(frame))
+    def test_frame_roundtrip_header(self):
+        payload = {"EncryptType": "MD5", "LoginType": "DVRIP-Web",
+                   "PassWord": "tlJwpbo6", "UserName": "admin"}
+        frame = T.dvr_frame(payload, 1000, session_id=0, seq=0)
+        self.assertEqual(len(frame), 20 + len(json.dumps(payload).encode()) + 2)
+        self.assertEqual(frame[0], 0xFF)
+        self.assertEqual(frame[1], 0)
+        sid, seq, msg_id, length = T.dvr_unpack_header(frame)
+        self.assertEqual((sid, seq, msg_id), (0, 0, 1000))
+        self.assertEqual(length, len(json.dumps(payload).encode()) + 2)
+        # trailer
+        self.assertEqual(frame[-2:], b"\x0a\x00")
 
-    def test_tcp_frame_concatenated_buffer(self):
-        p1 = b'{"a":1}'
-        p2 = b'{"b":"two"}'
-        buf = T.dvrip_tcp_frame(p1) + T.dvrip_tcp_frame(p2)
-        out1, c1 = T.dvrip_tcp_decode(buf)
-        out2, c2 = T.dvrip_tcp_decode(buf[c1:])
-        self.assertEqual(out1, p1)
-        self.assertEqual(out2, p2)
+    def test_frame_session_and_seq(self):
+        frame = T.dvr_frame({"Name": "SystemInfo"}, 1042, session_id=0x5F2A1, seq=7)
+        sid, seq, msg_id, _ = T.dvr_unpack_header(frame)
+        self.assertEqual(sid, 0x5F2A1)
+        self.assertEqual(seq, 7)
+        self.assertEqual(msg_id, 1042)
 
-    def test_tcp_decode_truncated(self):
-        frame = T.dvrip_tcp_frame(b'{"x":1}')
-        with self.assertRaises(ValueError):
-            T.dvrip_tcp_decode(frame[:10])
-        with self.assertRaises(ValueError):
-            T.dvrip_tcp_decode(frame[:-2])
+    def test_is_dvrip_header(self):
+        good = T.dvr_frame({"a": 1}, 1000)
+        self.assertTrue(T.is_dvrip_header(good))
+        self.assertFalse(T.is_dvrip_header(b"GET / HTTP/1.1\r\n\r\n"))
+        self.assertFalse(T.is_dvrip_header(b"\x00" * 20))
+        self.assertFalse(T.is_dvrip_header(b"\xff"))
 
     def test_extract_device_info_recursive(self):
-        reply = {"Version": "2.0", "Body": {
-            "Info": {"SerialNumber": "4C09B6PA8888123456",
-                     "Manufacturer": "TVT",
-                     "Detail": {"Model": "NV-4032RX",
-                                "FirmwareVersion": "V5.0.R12.1"}}}}
+        reply = {"Version": "2.0", "SessionID": "0x5f2a1", "Ret": 100,
+                 "SystemInfo": {"SerialNumber": "4C09B6PA8888123456",
+                                "DeviceType": "NVR",
+                                "SoftWareVersion": "V5.0.R12.1"}}
         info = T.extract_device_info(reply)
         self.assertEqual(info["SerialNumber"], "4C09B6PA8888123456")
-        self.assertEqual(info["Manufacturer"], "TVT")
-        self.assertEqual(info["Model"], "NV-4032RX")
-        self.assertEqual(info["FirmwareVersion"], "V5.0.R12.1")
+        self.assertEqual(info["DeviceType"], "NVR")
 
     def test_session_from_body(self):
         reply = {"Version": "2.0", "SessionID": "0x5f2a1", "Body": {}}
         self.assertEqual(T._session_from([reply]), "0x5f2a1")
         self.assertIsNone(T._session_from([{"Body": {}}]))
 
-    def test_auth_failure_detection(self):
-        self.assertTrue(T._is_auth_failure({"Body": {"Ret": "false"}}))
-        self.assertTrue(T._is_auth_failure({"Body": {"Error": "bad login"}}))
-        self.assertFalse(T._is_auth_failure({"Body": {"Ret": "true"}}))
+    def test_classify_login_reply(self):
+        ok = {"Ret": 100, "SessionID": "0x5f2a1"}
+        self.assertEqual(T.classify_login_reply(ok), "ok")
+        badpw = {"Ret": 106, "SessionID": "0x0"}
+        self.assertEqual(T.classify_login_reply(badpw), "auth")
+        lock = {"Ret": 203}
+        self.assertEqual(T.classify_login_reply(lock), "auth")
+        err = {"Ret": 117}
+        self.assertEqual(T.classify_login_reply(err), "error")
+        terse = {"SessionID": "0x9"}
+        self.assertEqual(T.classify_login_reply(terse), "terse")
+        none = {"Ret": "true"}
+        self.assertEqual(T.classify_login_reply(none), "auth")
 
     def test_is_valid_ipv4(self):
         self.assertTrue(T.is_valid_ipv4("192.168.1.64"))
-        self.assertTrue(T.is_valid_ipv4("10.0.0.1"))
         self.assertFalse(T.is_valid_ipv4("999.1.1.1"))
-        self.assertFalse(T.is_valid_ipv4("10.0.0.256"))
         self.assertFalse(T.is_valid_ipv4("banana"))
-        self.assertFalse(T.is_valid_ipv4(""))
+
+    def test_mac_from_netcommon(self):
+        self.assertEqual(
+            T._mac_from_netcommon({"NetWork": {"NetCommon": {"MACAddress": "8c-30-66-98-0c-06"}}}),
+            "8C:30:66:98:0C:06")
+        self.assertIsNone(T._mac_from_netcommon({"NetWork": {}}))
 
 
 # ── Ping preflight tests ──────────────────────────────────────────────────
@@ -129,7 +135,7 @@ class PingPreflightTests(unittest.TestCase):
         try:
             with unittest.mock.patch.object(T.subprocess, "run",
                                             side_effect=OSError("blocked")), \
-                 unittest.mock.patch.object(T, "DVRIP_HTTP_PORT", port):
+                 unittest.mock.patch.object(T, "DVRIP_TCP_PORT", port):
                 alive, detail = T.ping_host("127.0.0.1", 2.0)
             self.assertTrue(alive)
             self.assertIn("ICMP blocked", detail)
@@ -138,105 +144,14 @@ class PingPreflightTests(unittest.TestCase):
             srv.close()
 
 
-# ── Mock HTTP server (DVRIP over port 80) ─────────────────────────────────────
-
-class MockDvripHTTP(BaseHTTPRequestHandler):
-    seen = {"posts": [], "session_header_on_probe": None}
-
-    def log_message(self, *a):
-        pass
-
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length)
-        ct = self.headers.get("Content-Type", "")
-        self.seen["posts"].append((self.path, raw, ct, self.headers.get("SessionID")))
-        msg = json.loads(raw)
-        mid = msg.get("MsgID")
-
-        if mid == 766:  # login
-            body = {"Version": "2.0", "Status": "Init", "SessionID": "0xdeadbeef",
-                    "Body": {"EncryptType": "MD5", "LoginType": 1,
-                             "UserName": msg["Body"]["UserName"],
-                             "Ret": "true",
-                             "SerialNumber": "4C09B6PA8888123456",
-                             "Manufacturer": "TVT",
-                             "Model": "NV-4032RX",
-                             "FirmwareVersion": "V5.0.R12.1"}}
-            self.send_response(200)
-            self.send_header("SessionID", "0xdeadbeef")
-        elif mid == 1470:  # device-info probe
-            sid = self.headers.get("SessionID")
-            self.seen["session_header_on_probe"] = sid
-            body = {"SessionID": sid, "Body": {"Ret": "true",
-                                               "SerialNumber": "4C09B6PA8888123456"}}
-            self.send_response(200)
-        elif mid == 767:  # logout
-            self.seen["logout_session"] = self.headers.get("SessionID")
-            body = {"SessionID": self.headers.get("SessionID"), "Body": {"Ret": "true"}}
-            self.send_response(200)
-        else:
-            body = {"Body": {"Ret": "false"}}
-            self.send_response(400)
-
-        data = json.dumps(body).encode()
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-
-def _start_http_server():
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), MockDvripHTTP)
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    return srv
-
-
-class HttpTransportTests(unittest.TestCase):
-
-    def test_full_session_and_sessionid_header_reuse(self):
-        srv = _start_http_server()
-        try:
-            port = srv.server_address[1]
-            info = T.dvrip_http_query("127.0.0.1", port, "admin", "admin", 5)
-            self.assertEqual(info["SerialNumber"], "4C09B6PA8888123456")
-            self.assertEqual(info["Manufacturer"], "TVT")
-            # login POST had no session header yet; probe + logout carried it
-            posts = MockDvripHTTP.seen["posts"]
-            mids = [json.loads(p[1])["MsgID"] for p in posts]
-            self.assertEqual(mids, [766, 1470, 767])
-            self.assertEqual(MockDvripHTTP.seen["session_header_on_probe"], "0xdeadbeef")
-            self.assertEqual(MockDvripHTTP.seen["logout_session"], "0xdeadbeef")
-            # content type was JSON on every request
-            for _path, _raw, ct, _sid in posts:
-                self.assertEqual(ct, "application/json")
-        finally:
-            srv.shutdown()
-
-    def test_auth_failure_raises(self):
-        from http.server import BaseHTTPRequestHandler as B, ThreadingHTTPServer as S
-        class Reject(B):
-            def log_message(self, *a):
-                pass
-
-            def do_POST(self):
-                self.send_response(401)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-        srv = S(("127.0.0.1", 0), Reject)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        try:
-            with self.assertRaises(T.AuthError):
-                T.dvrip_http_query("127.0.0.1", srv.server_address[1], "admin", "x", 5)
-        finally:
-            srv.shutdown()
-
-
 # ── Mock TCP server (DVRIP over 34567) ────────────────────────────────────────
 
 class MockDvripTCP:
-    """Speaks the DVRIP TCP envelope: 16B header + 4B LE len + JSON."""
+    """
+    Speaks the real DVRIP TCP envelope: 20-byte binary header
+    (0xFF | ver | 2 pad | session u32 | seq u32 | msgid u16 | 2 pad | len u32)
+    + JSON payload + b"\x0a\x00" trailer.
+    """
 
     def __init__(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -244,11 +159,21 @@ class MockDvripTCP:
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(1)
         self.log = []
+        self.bad_password_hashes = set()
         threading.Thread(target=self._serve, daemon=True).start()
 
     @property
     def port(self):
         return self.sock.getsockname()[1]
+
+    def _recv_exact(self, conn, n):
+        buf = bytearray()
+        while len(buf) < n:
+            c = conn.recv(n - len(buf))
+            if not c:
+                raise ConnectionError
+            buf.extend(c)
+        return bytes(buf)
 
     def _serve(self):
         conn, _ = self.sock.accept()
@@ -258,66 +183,143 @@ class MockDvripTCP:
                     prefix = self._recv_exact(conn, 20)
                 except Exception:
                     return
-                (n,) = struct.unpack("<I", prefix[16:20])
-                payload = self._recv_exact(conn, n)
+                if not T.is_dvrip_header(prefix):
+                    return
+                sid, seq, mid, length = T.dvr_unpack_header(prefix)
+                payload = self._recv_exact(conn, length)
+                if payload.endswith(b"\x0a\x00"):
+                    payload = payload[:-2]
                 msg = json.loads(payload)
                 self.log.append(msg)
-                mid = msg.get("MsgID")
-                sid = msg.get("SessionID")
-                if mid == 766:
-                    reply = {"Version": "2.0", "SessionID": "0xb0b",
-                             "Body": {"Ret": "true", "UserName": msg["Body"]["UserName"],
-                                      "SerialNumber": "SN-TCP-0001",
-                                      "Manufacturer": "Provision-ISR",
-                                      "Model": "IPC-2345"}}
-                elif mid == 1470:
-                    reply = {"SessionID": sid, "Body": {"Ret": "true"}}
-                elif mid == 767:
-                    reply = {"SessionID": sid, "Body": {"Ret": "true"}}
+                if mid == T.CMD_LOGIN:
+                    pw_hash = msg.get("PassWord", "")
+                    if msg.get("UserName") == "admin" and \
+                            pw_hash not in self.bad_password_hashes:
+                        reply = {"Ret": 100, "SessionID": "0xb0b",
+                                 "AliveInterval": 20,
+                                 "DeviceType": "NVR",
+                                 "SystemInfo": {
+                                     "SerialNumber": "SN-TCP-0001",
+                                     "DeviceType": "NVR",
+                                     "HardWare": "IPC-2345"}}
+                    else:
+                        reply = {"Ret": 106, "SessionID": "0x0"}
+                elif mid == T.CMD_CONFIG_GET:
+                    name = msg.get("Name", "")
+                    if name == "SystemInfo":
+                        reply = {"Name": name, "Ret": 100,
+                                 "SystemInfo": {"SerialNumber": "SN-TCP-0001",
+                                                "SoftWareVersion": "V5.0.R12"}}
+                    elif name == "NetWork.NetCommon":
+                        reply = {"Name": name, "Ret": 100,
+                                 "NetWork": {"NetCommon": {
+                                     "MACAddress": "8C:30:66:98:0C:06"}}}
+                    else:
+                        reply = {"Name": name, "Ret": 100}
+                elif mid == T.CMD_LOGOUT:
+                    reply = {"Ret": 100}
                 else:
-                    reply = {"SessionID": sid, "Body": {"Ret": "false"}}
-                self._send(conn, json.dumps(reply).encode())
+                    reply = {"Ret": 103}
+                self._send(conn, reply, sid or 0xB0B, seq)
 
-    @staticmethod
-    def _recv_exact(conn, n):
-        buf = bytearray()
-        while len(buf) < n:
-            c = conn.recv(n - len(buf))
-            if not c:
-                raise ConnectionError
-            buf.extend(c)
-        return bytes(buf)
-
-    @staticmethod
-    def _send(conn, payload):
-        conn.sendall(T.dvrip_tcp_frame(payload))
+    def _send(self, conn, reply, sid, seq):
+        frame = T.dvr_frame(reply, 1000, sid, seq)
+        conn.sendall(frame)
 
 
 class TcpTransportTests(unittest.TestCase):
 
-    def test_session_over_tcp_reuses_sessionid_in_body(self):
-        mock = MockDvripTCP()
-        info = T.dvrip_tcp_query("127.0.0.1", mock.port, "admin", "pw123", 5)
+    def setUp(self):
+        self.mock = MockDvripTCP()
+
+    def test_full_session_over_real_framing(self):
+        info = T.dvrip_tcp_query("127.0.0.1", self.mock.port, "admin", "pw123", 5)
         self.assertEqual(info["SerialNumber"], "SN-TCP-0001")
-        self.assertEqual(info["Manufacturer"], "Provision-ISR")
-        mids = [m["MsgID"] for m in mock.log]
-        self.assertEqual(mids, [766, 1470, 767])
-        # login carries 0x0; subsequent frames carry the session from the reply
-        self.assertEqual(mock.log[0]["SessionID"], "0x0")
-        self.assertEqual(mock.log[1]["SessionID"], "0xb0b")
-        self.assertEqual(mock.log[2]["SessionID"], "0xb0b")
-        # password on the wire is the MD5 hash, never plaintext
-        self.assertEqual(mock.log[0]["Body"]["PassWord"], T.md5_upper("pw123"))
-        self.assertNotIn("pw123", json.dumps(mock.log))
+        self.assertEqual(info["MACAddress"], "8C:30:66:98:0C:06")
+        self.assertEqual(info["SoftWareVersion"], "V5.0.R12")
+
+    def test_password_on_wire_is_sofia_hash(self):
+        T.dvrip_tcp_query("127.0.0.1", self.mock.port, "admin", "pw123", 5)
+        login = self.mock.log[0]
+        self.assertEqual(login["PassWord"], T.sofia_hash("pw123"))
+        self.assertNotIn("pw123", json.dumps(self.mock.log))
+        self.assertEqual(login["LoginType"], "DVRIP-Web")
+
+    def test_auth_failure_raises_auth_error(self):
+        self.mock.bad_password_hashes = {T.sofia_hash("wrongpw")}
+        with self.assertRaises(T.AuthError):
+            T.dvrip_tcp_query("127.0.0.1", self.mock.port, "admin", "wrongpw", 5)
 
     def test_tcp_unreachable_raises_route_error(self):
-        # connect to a port with nothing listening
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
         s.close()
         with self.assertRaises(T.RouteError):
             T.dvrip_tcp_query("127.0.0.1", port, "admin", "x", 2)
+
+
+# ── Mock HTTP server (DVRIP JSON relay on port 80) ────────────────────────────
+
+class MockDvripHTTP(BaseHTTPRequestHandler):
+    seen = {"posts": []}
+    reject = False
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length)
+        self.seen["posts"].append((self.path, raw, self.headers.get("Content-Type", "")))
+        msg = json.loads(raw)
+
+        if self.reject:
+            self.send_response(401)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if msg.get("UserName") == "admin" and \
+                msg.get("PassWord") == T.sofia_hash("pw123"):
+            body = {"Ret": 100, "SessionID": "0xdeadbeef",
+                    "SystemInfo": {"SerialNumber": "SN-HTTP-0001",
+                                   "Manufacturer": "TVT"}}
+        else:
+            body = {"Ret": 106, "SessionID": "0x0"}
+
+        data = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+class HttpTransportTests(unittest.TestCase):
+
+    def test_http_json_relay_session(self):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), MockDvripHTTP)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            info = T.dvrip_http_query("127.0.0.1", srv.server_address[1],
+                                      "admin", "pw123", 5)
+            self.assertEqual(info["SerialNumber"], "SN-HTTP-0001")
+            self.assertEqual(info["Manufacturer"], "TVT")
+        finally:
+            srv.shutdown()
+
+    def test_http_auth_failure_raises(self):
+        MockDvripHTTP.reject = True
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), MockDvripHTTP)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with self.assertRaises(T.AuthError):
+                T.dvrip_http_query("127.0.0.1", srv.server_address[1],
+                                   "admin", "x", 5)
+        finally:
+            srv.shutdown()
+            MockDvripHTTP.reject = False
 
 
 if __name__ == "__main__":

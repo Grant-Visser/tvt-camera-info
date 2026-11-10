@@ -83,16 +83,18 @@ python tvt_camera_info.py --ip 192.168.1.64 --password YourCameraPassword
 By default the tool tries three protocols, in this order, and prints the
 result of the first one that works:
 
-1. **DVRIP over HTTP (port 80)** — the TVT/Provision-ISR native "NetSurveillance"
-   protocol. The camera's model/serial/firmware are returned as JSON. This is
-   the protocol these cameras use by default.
-2. **DVRIP over TCP (port 34567)** — the same protocol over a raw socket with
-   length-prefixed frames, for cameras where the HTTP service is off.
+1. **DVRIP over TCP (port 34567)** — the camera's native "NetSurveillance"
+   (DVRIP/Sofia) protocol. The camera's model/serial/firmware/MAC are returned
+   as JSON. This is what these devices actually speak.
+2. **DVRIP over HTTP (port 80)** — the web service relaying the same JSON, for
+   devices where the raw TCP service is firewalled.
 3. **ONVIF (port 8899)** — the open camera standard. **Last resort only** —
    many of these cameras ship with ONVIF disabled.
 
-The password is **never sent in plaintext**: it is hashed with MD5 first
-(that's what the camera protocol requires).
+The password is **never sent in plaintext**: it is sent as the protocol's
+required "sofia hash" (an MD5-derived digest), and special characters are
+safe — the hash step is exactly what the camera expects. Quote complex
+passwords on the command line: `--password "YourPassword!"`
 
 Optional flags:
 
@@ -159,14 +161,21 @@ tool.
 
 ## For the technical reader
 
-- **DVRIP HTTP:** raw JSON POSTs (`Content-Type: application/json`) to
-  `http://<ip>/` (with `/RPC2` and `/cgi-bin/interface` fallbacks). Login =
-  `MsgID 766` (`OPMachine`), logout = `MsgID 767`. Password is MD5-hex-uppercase
-  in `Body.PassWord`. The `SessionID` from the reply (header and/or body) is
-  echoed back on every subsequent request. If a digest challenge appears, the
-  tool retries with RFC 2617 Digest auth (password still never sent plaintext).
-- **DVRIP TCP:** same JSON envelope over port 34567, framed as a 16-byte header
-  (`HI` magic) + 4-byte little-endian payload length + JSON.
+- **DVRIP TCP:** the NETsurveillance binary envelope on port 34567 —
+  a 20-byte header (`0xFF` magic, session id, packet sequence, command id,
+  payload length) + JSON + a `\x0a\x00` trailer. Login is **command 1000**
+  with `LoginType: DVRIP-Web` and the password as a **sofia hash** in
+  `PassWord` (MD5 digest bytes folded pairwise mod 62 into alphanumeric
+  characters — the canonical vectors: empty password → `tlJwpbo6`,
+  `admin` → `6QNMIQGe`). Device info comes from `Config-Get` (command 1042)
+  for `SystemInfo` and `NetWork.NetCommon` (MAC address); logout is command
+  1201. The session id returned by the camera is echoed in every following
+  frame header. Return codes follow the Xiongmai table: `100` = OK,
+  `106`/`203` = wrong username or password.
+- **DVRIP HTTP:** the camera's web service (port 80) relays the same JSON —
+  each POST carries one command's JSON body; the reply is the same JSON as
+  over TCP. The tool retries the session with and without a `Command` header
+  for firmwares that differ.
 - **ONVIF:** raw SOAP (`GetDeviceInformation`, `GetNetworkInterfaces`) to
   `http://<ip>:8899/onvif/device_service` — no ONVIF library dependency.
 - MAC address is cross-checked against the local ARP table when a protocol
@@ -176,11 +185,12 @@ tool.
 
 ### ⚠️ Tested against mock servers, NOT yet against a real camera
 
-The DVRIP framing, login/logout flow, session handling and error paths are
-covered by automated tests against local mock HTTP/TCP servers
-(`test_tvt_camera_info.py` — 14 tests). The exact **device-info request** a
-given firmware family answers with (and the exact field names it returns) can
-vary between TVT firmware revisions, so this build was **not validated against
-real hardware** — if a field is missing from the output on a live camera, the
-information is still usually present in the login reply; report the exact
-output and firmware version when asking for support.
+The DVRIP binary framing, command-1000 login with sofia-hash credentials,
+config-get queries, logout, session handling and error paths are covered by
+automated tests against local mock servers speaking the real frame format
+(`test_tvt_camera_info.py` — 21 tests, verified end-to-end). The protocol
+implementation follows the reference NETsurveillance client stacks
+(OpenIPC/python-dvr and peers). The exact **device-info fields** a given
+firmware returns can still vary between TVT firmware revisions — if a field
+is missing from the output on a live camera, report the exact output and
+firmware version when asking for support.

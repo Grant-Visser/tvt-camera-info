@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-tvt-camera-info.py — look up a TVT / Provision-ISR camera's serial number and
-MAC address over the LAN.
+tvt-camera-info.py — look up a TVT / Provision-ISR / Xiongmai-family camera's
+serial number and MAC address over the LAN.
 
-TVT / Provision-ISR devices speak DVRIP ("NetSurveillance") — a JSON protocol.
-Attempt order (auto):
-  1. HTTP  DVRIP on port 80      (http://<ip>/ — plain HTTP POST of JSON frames)
-  2. TCP   DVRIP on port 34567   (length-prefixed JSON frames)
+These devices speak DVRIP ("NetSurveillance" / "Sofia") — a JSON protocol
+sent as length-prefixed binary frames. Login is command 1000 with a
+"sofia hash" of the password (never plaintext). Attempt order (auto):
+  1. TCP   DVRIP on port 34567   (the protocol's native transport)
+  2. HTTP  DVRIP on port 80      (the web service relays the same JSON)
   3. ONVIF SOAP on port 8899     (last resort — often disabled on these cameras)
 
 The MAC is cross-checked against the local ARP table when a protocol doesn't
-report one. Works on Windows, Linux and macOS. Python 3.8+, standard library only.
+report one. Works on Windows, Linux and macOS. Python 3.8+, standard library
+only.
 """
 
 import argparse
@@ -22,6 +24,7 @@ import socket
 import struct
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -39,7 +42,13 @@ DVRIP_TCP_PORT = 34567
 ONVIF_PORT = 8899
 
 ONVIF_PATH = "/onvif/device_service"
-DVRIP_SUBPATHS = ["/", "/RPC2", "/cgi-bin/interface"]  # some firmwares differ
+
+# ── DVRIP command codes (NETsurveillance / Sofia) ─────────────────────────────
+CMD_LOGIN = 1000            # CMD_LOGIN (OPMachine variant used by all real stacks)
+CMD_LOGOUT = 1201           # CMD_LOGOUT
+CMD_KEEPALIVE = 1006        # CMD_KEEPALIVE
+CMD_CONFIG_GET = 1042       # CMD_CONFIG_GET — Name may be "SystemInfo"/"General"/...
+CMD_SYSINFO = 1020          # CMD_SYSINFO
 
 
 def die(msg: str, code: int) -> "None":
@@ -59,15 +68,22 @@ class UnexpectedError(Exception):
     pass
 
 
-class AmbiguousAuthError(Exception):
-    """Login reply could be a rejection or just a terse session grant."""
-
-
-# ── DVRIP framing ─────────────────────────────────────────────────────────────
+# ── DVRIP password hashing ────────────────────────────────────────────────────
 
 def md5_upper(s: str) -> str:
-    """MD5 hex digest, uppercase — the DVRIP password hash sent on the wire."""
+    """MD5 hex digest, uppercase — hash used by some web-login variants."""
     return hashlib.md5(s.encode("utf-8")).hexdigest().upper()
+
+
+def sofia_hash(password: str = "") -> str:
+    """
+    The DVRIP "sofia hash": MD5 of the password, then each pair of adjacent
+    digest bytes summed mod 62 into an alphanumeric character. This is what
+    every known Xiongmai/TVT-family client sends in Body.PassWord.
+    """
+    md5 = hashlib.md5(password.encode("utf-8")).digest()
+    chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    return "".join(chars[(a + b) % 62] for a, b in zip(md5[::2], md5[1::2]))
 
 
 def is_valid_ipv4(ip: str) -> bool:
@@ -118,7 +134,7 @@ def ping_host(ip: str, timeout: float) -> "tuple[bool, str]":
         return True, detail
 
     # ICMP blocked ≠ camera absent: try a TCP connect on the DVRIP ports.
-    for port in (DVRIP_HTTP_PORT, DVRIP_TCP_PORT):
+    for port in (DVRIP_TCP_PORT, DVRIP_HTTP_PORT):
         try:
             with socket.create_connection((ip, port), timeout=timeout):
                 return True, (f"ICMP blocked, but TCP port {port} is open — "
@@ -128,87 +144,70 @@ def ping_host(ip: str, timeout: float) -> "tuple[bool, str]":
     return False, detail
 
 
-def dvr_login_body(user: str, password: str) -> dict:
-    """DVRIP login frame (MsgID 766). Password is MD5-hex-uppercase, never plaintext."""
-    return {"Version": "2.0", "SessionID": "0x0", "RequestType": 0,
-            "Type": "OPMachine", "MsgID": 766,
-            "Body": {"EncryptType": "MD5",
-                     "PassWord": md5_upper(password),
-                     "UserName": user}}
+# ── DVRIP frames ──────────────────────────────────────────────────────────────
+
+def dvr_login_body(user: str, password: str, encrypt: str = "MD5") -> dict:
+    """
+    DVRIP login frame for command 1000. Password is the sofia hash,
+    never plaintext. Known-good default hash for an empty password
+    is "tlJwpbo6", and "admin" hashes to "6QNMIQGe".
+    """
+    return {"EncryptType": encrypt,
+            "LoginType": "DVRIP-Web",
+            "PassWord": sofia_hash(password),
+            "UserName": user}
 
 
 def dvr_logout_body() -> dict:
-    """DVRIP logout frame (MsgID 767)."""
-    return {"Type": "OPMachine", "MsgID": 767, "Body": {}}
+    """DVRIP logout body for command 1201."""
+    return {"Name": "", "SessionID": "0x0"}
 
 
-def dvr_generic_body(msgid: int) -> dict:
-    """A generic OPMachine query — used to probe for device info (best-effort)."""
-    return {"Type": "OPMachine", "MsgID": msgid, "Body": {}}
+def dvr_config_get_body(name: str) -> dict:
+    """Config-Get body for command 1042 (e.g. SystemInfo / NetWork.NetCommon)."""
+    return {"Name": name, "SessionID": "0x0"}
 
 
-def dvr_frame(payload: dict, session_id: "str | None" = None) -> bytes:
-    """JSON-encode a DVRIP message, injecting the session id if known."""
-    msg = dict(payload)
-    if session_id:
-        msg["SessionID"] = session_id
-    return json.dumps(msg).encode("utf-8")
-
-
-# ── TCP DVRIP framing (port 34567) ───────────────────────────────────────────
-#
-# Frame layout: 16-byte header | 4-byte little-endian payload length | JSON.
-# The 16-byte header starts with the "HI" magic used by TVT's NetSurveillance
-# protocol; the length field is the byte length of the JSON payload that follows.
-
-DVRIP_TCP_HEADER = 16
-DVRIP_TCP_LEN = 4
-DVRIP_TCP_PREFIX = DVRIP_TCP_HEADER + DVRIP_TCP_LEN  # 20
-
-
-def dvrip_tcp_frame(payload: bytes) -> bytes:
-    """Wrap a JSON payload in a DVRIP TCP frame."""
-    header = b"HI" + (b"\x00" * (DVRIP_TCP_HEADER - 2))
-    return header + struct.pack("<I", len(payload)) + payload
-
-
-def dvrip_tcp_decode(frame: bytes) -> "tuple[bytes, int]":
+def dvr_frame(payload: dict, msg_id: int,
+              session_id: "int | None" = None, seq: int = 0) -> bytes:
     """
-    Unpack one DVRIP TCP frame.
-    Returns (payload, consumed) — consumed is 20 + len(payload), so a buffer
-    holding several concatenated frames can be split correctly.
+    Wrap a JSON body in the 20-byte DVRIP binary envelope:
+      0xFF | version(0) | 2 reserved | SessionID (u32 LE) | packet seq (u32 LE)
+      | MsgID (u16 LE) | 2 reserved | payload length (u32 LE, includes trailer)
+    followed by the JSON payload and a b"\\x0a\\x00" trailer.
     """
-    if len(frame) < DVRIP_TCP_PREFIX:
-        raise ValueError("frame too short for DVRIP prefix")
-    header, length = frame[:DVRIP_TCP_HEADER], struct.unpack("<I", frame[
-        DVRIP_TCP_HEADER:DVRIP_TCP_PREFIX])[0]
-    if len(frame) < DVRIP_TCP_PREFIX + length:
-        raise ValueError("frame truncated")
-    return frame[DVRIP_TCP_PREFIX:DVRIP_TCP_PREFIX + length], DVRIP_TCP_PREFIX + length
+    data = json.dumps(payload).encode("utf-8")
+    if session_id is None:
+        session_id = 0
+    header = struct.pack("BB2xII2xHI", 0xFF, 0, session_id, seq, msg_id,
+                         len(data) + 2)
+    return header + data + b"\x0a\x00"
 
 
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise RouteError("connection closed by camera mid-frame")
-        buf.extend(chunk)
-    return bytes(buf)
+def dvr_unpack_header(frame: bytes) -> "tuple[int, int, int, int]":
+    """(session_id, seq, msg_id, payload_len) from a 20-byte DVRIP header."""
+    _head, _ver, session_id, seq, msg_id, length = struct.unpack(
+        "BB2xII2xHI", frame[:20])
+    return session_id, seq, msg_id, length
 
 
-def _recv_tcp_frame(sock: socket.socket) -> bytes:
-    prefix = _recv_exact(sock, DVRIP_TCP_PREFIX)
-    length = struct.unpack("<I", prefix[DVRIP_TCP_HEADER:])[0]
-    if length < 0 or length > 16 * 1024 * 1024:
-        raise RouteError(f"implausible DVRIP frame length {length}")
-    return _recv_exact(sock, length)
+def is_dvrip_header(frame: bytes) -> bool:
+    """Header sanity: starts with 0xFF, version byte 0, plausible length."""
+    if len(frame) < 20 or frame[0] != 0xFF:
+        return False
+    try:
+        length = dvr_unpack_header(frame)[3]
+    except struct.error:
+        return False
+    return 0 < length <= 16 * 1024 * 1024
 
 
 # ── Shared DVRIP helpers ──────────────────────────────────────────────────────
 
 DEVICE_INFO_KEYS = ("serialnumber", "manufacturer", "model", "firmware",
-                    "firmwareversion", "devicename", "hardware")
+                    "firmwareversion", "devicename", "hardware",
+                    "devicetype", "hardware", "hardwareversion",
+                    "softwareversion", "serialno", "macaddress")
 
 
 def extract_device_info(obj) -> dict:
@@ -246,42 +245,168 @@ def _session_from(any_dicts) -> "str | None":
     return None
 
 
-def _is_auth_failure(obj) -> bool:
-    """Best-effort detection of a rejected login in a DVRIP reply."""
-    if not isinstance(obj, dict):
-        return False
-    body = obj.get("Body") or {}
-    if isinstance(body, dict):
-        if str(body.get("Ret")).strip().lower() in ("false", "fail"):
-            return True
-        if str(body.get("Ret")).strip() == "0" and not _is_positive_login(obj):
-            return True
-        if body.get("Error") or body.get("Reason"):
-            return True
-    return False
+# Xiongmai return codes that mean "credentials rejected"
+AUTH_FAIL_RETS = {103, 106, 203, 204, 214, 216, 606}
+# Non-auth-specific error codes worth surfacing distinctly
+GENERIC_FAIL_RETS = {101, 117, 502, 605}
 
 
-def _is_positive_login(obj) -> bool:
-    """True only when the reply carries a real session id."""
-    if not isinstance(obj, dict):
-        return False
-    s = _session_from([obj])
-    if not s:
-        return False
-    if str(s).strip().lower() in ("0x0", "0", "null", "none", ""):
-        return False
-    return True
+def classify_login_reply(reply: dict) -> str:
+    """
+    Classify a login (1000) reply: "ok", "auth", "error" or "terse".
+    Success = Ret in {100, 150, ...OK codes} AND a real SessionID.
+    """
+    ret = reply.get("Ret")
+    try:
+        ret_i = int(ret)
+    except (TypeError, ValueError):
+        ret_i = None
+    session = _session_from([reply])
+    good_session = bool(session) and str(session).strip().lower() not in (
+        "0x0", "0", "null", "none", "")
+    if ret_i in (100, 150, 515) and good_session:
+        return "ok"
+    if ret_i in AUTH_FAIL_RETS:
+        return "auth"
+    if ret_i in GENERIC_FAIL_RETS:
+        return "error"
+    if ret_i is not None:
+        # Unknown numeric code — auth if no session was granted, else terse
+        return "error" if good_session else "auth"
+    if good_session:
+        return "terse"  # no Ret but a real session id — treat as success
+    return "auth"
 
+
+# ── TCP transport (the protocol's native transport, port 34567) ───────────────
+
+class _DvripTcpSession:
+    """
+    One DVRIP-over-TCP session: connect → login(1000) → queries → logout(1201).
+    Implements the exact framing used by every known Xiongmai client.
+    """
+
+    def __init__(self, ip: str, port: int, timeout: float):
+        self.timeout = timeout
+        try:
+            self.sock = socket.create_connection((ip, port), timeout=timeout)
+        except OSError as e:
+            raise RouteError(f"could not connect ({e})") from None
+        self.sock.settimeout(timeout)
+        self.session = 0
+        self.seq = 0
+
+    def _recv_exact(self, n: int) -> bytes:
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise RouteError("connection closed by camera mid-frame")
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def send(self, payload: dict, msg_id: int) -> dict:
+        self.seq += 1
+        self.sock.sendall(dvr_frame(payload, msg_id, self.session, self.seq))
+        prefix = self._recv_exact(20)
+        if not is_dvrip_header(prefix):
+            raise UnexpectedError("camera sent a frame that is not DVRIP")
+        sid, _seq, _mid, length = dvr_unpack_header(prefix)
+        raw = self._recv_exact(length)
+        if raw.endswith(b"\x0a\x00"):
+            raw = raw[:-2]
+        try:
+            reply = json.loads(raw.decode("utf-8", errors="replace"))
+        except ValueError:
+            raise UnexpectedError("camera reply was not valid DVRIP JSON") from None
+        if sid:
+            self.session = sid
+        return reply
+
+    def login(self, user: str, password: str) -> dict:
+        reply = self.send(dvr_login_body(user, password), CMD_LOGIN)
+        verdict = classify_login_reply(reply)
+        if verdict == "ok":
+            try:
+                self.session = int(str(_session_from([reply])), 16)
+            except (TypeError, ValueError):
+                pass
+            return reply
+        if verdict == "auth":
+            raise AuthError("camera rejected the login (bad username/password)")
+        if verdict == "terse":
+            return reply
+        raise UnexpectedError(f"camera returned error code {reply.get('Ret')!r} "
+                              f"for the login")
+
+    def config_get(self, name: str) -> dict:
+        body = dvr_config_get_body(name)
+        body["SessionID"] = f"0x{self.session:08X}" if self.session else "0x0"
+        return self.send(body, CMD_CONFIG_GET)
+
+    def logout(self) -> None:
+        try:
+            body = dvr_logout_body()
+            body["SessionID"] = f"0x{self.session:08X}" if self.session else "0x0"
+            self.send(body, CMD_LOGOUT)
+        except (AuthError, RouteError, UnexpectedError, OSError):
+            pass
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def dvrip_tcp_query(ip: str, port: int, user: str, password: str,
+                    timeout: float) -> dict:
+    """Full DVRIP session over raw TCP: login → info queries → logout."""
+    sess = _DvripTcpSession(ip, port, timeout)
+    try:
+        login_reply = sess.login(user, password)
+        info = extract_device_info(login_reply)
+        for name in ("SystemInfo", "NetWork.NetCommon", "General"):
+            try:
+                info.update(extract_device_info(sess.config_get(name)))
+            except (AuthError, RouteError, UnexpectedError):
+                continue  # best-effort
+        if not info.get("MACAddress"):
+            nc = sess.config_get("NetWork.NetCommon")
+            mac = _mac_from_netcommon(nc)
+            if mac:
+                info["MACAddress"] = mac
+        sess.logout()
+        return info
+    finally:
+        sess.close()
+
+
+def _mac_from_netcommon(reply: dict) -> "str | None":
+    """MACAddress inside NetWork.NetCommon config replies."""
+    stack = [reply]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            for k, v in cur.items():
+                if k.lower() == "macaddress" and isinstance(v, str) \
+                        and re.match(r"^[0-9A-Fa-f: -]{12,17}$", v):
+                    return v.replace("-", ":").upper()
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return None
+
+
+# ── HTTP transport (the web service relays the same JSON, port 80) ────────────
 
 def _http_post_json(url: str, frame: bytes, timeout: float,
-                    session_id: "str | None" = None,
-                    digest_auth: "str | None" = None) -> "tuple[bytes, dict | None]":
+                    session_id: "str | None" = None) -> "tuple[bytes, dict | None]":
     headers = {"Content-Type": "application/json", "Connection": "keep-alive",
-               "User-Agent": "tvt-camera-info/1.0"}
+               "User-Agent": "tvt-camera-info/1.1"}
     if session_id:
         headers["SessionID"] = session_id
-    if digest_auth:
-        headers["Authorization"] = digest_auth
     req = urllib.request.Request(url, data=frame, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -290,197 +415,84 @@ def _http_post_json(url: str, frame: bytes, timeout: float,
         if e.code in (401, 400, 403):
             raise AuthError(f"camera rejected the request (HTTP {e.code})") from None
         raise UnexpectedError(f"camera answered HTTP {e.code}") from None
+    except (socket.timeout, TimeoutError):
+        raise RouteError("connection timed out") from None
+    except (ConnectionError, OSError) as e:
+        raise RouteError(f"could not connect ({e})") from None
 
-
-def _digest_authorization(challenge: str, user: str, password: str,
-                          method: str, uri: str) -> "str | None":
-    """RFC 2617 Digest challenge → Authorization header (password never sent plaintext)."""
-    parts = {}
-    for m in re.finditer(r'(\w+)="([^"]*)"', challenge):
-        parts[m.group(1)] = m.group(2)
-    if "realm" not in parts or "nonce" not in parts:
-        return None
-    ha1 = md5_upper(f"{user}:{parts['realm']}:{password}")
-    ha2 = md5_upper(f"{method}:{uri}")
-    response = md5_upper(f"{ha1}:{parts['nonce']}:{ha2}")
-    qop = parts.get("qop")
-    if qop:
-        nc = "00000001"
-        cnonce = hashlib.md5(str(time_ns_placeholder()).encode()).hexdigest()[:8]
-        response = md5_upper(f"{ha1}:{parts['nonce']}:{nc}:{cnonce}:{qop.split(',')[0]}:{ha2}")
-    auth = (f'Digest username="{user}", realm="{parts["realm"]}", '
-            f'nonce="{parts["nonce"]}", uri="{uri}", '
-            f'response="{response}"')
-    if qop:
-        auth += f', qop={qop.split(",")[0]}, nc={nc}, cnonce="{cnonce}"'
-    return auth
-
-
-def time_ns_placeholder() -> int:
-    import time
-    try:
-        return time.time_ns()
-    except AttributeError:  # Python < 3.7
-        return int(time.time() * 1e9)
-
-
-# ── DVRIP over HTTP (port 80) ────────────────────────────────────────────────
 
 def dvrip_http_query(ip: str, port: int, user: str, password: str,
                      timeout: float) -> dict:
     """
-    Full DVRIP session over plain HTTP: login → device-info probe → logout.
-    Raises AuthError / RouteError. Returns the device-info fields found.
+    The camera's HTTP service relays the same DVRIP JSON: each POST carries one
+    command's JSON body; the numeric command rides in a Command header when the
+    firmware honours it, and the reply is the same JSON as over TCP.
     """
-    last_route_err = None
-
-    def attempt(path: str, digest: "str | None" = None) -> "dict | None":
-        url = f"http://{ip}:{port}{path}"
-        frame = dvr_frame(dvr_login_body(user, password))
+    url = f"http://{ip}:{port}/"
+    last_err: "Exception | None" = None
+    for mode in ("with-header", "plain"):
         try:
-            raw, headers = _http_post_json(url, frame, timeout,
-                                           digest_auth=digest)
+            info = _dvrip_http_attempt(url, user, password, timeout,
+                                       send_command_header=(mode == "with-header"))
+            if info:
+                return info
+            last_err = UnexpectedError("camera returned empty device info")
         except AuthError:
             raise
-        except (socket.timeout, TimeoutError):
-            raise RouteError("connection timed out") from None
-        except (ConnectionError, OSError) as e:
-            raise RouteError(f"could not connect ({e})") from None
+        except (RouteError, UnexpectedError) as e:
+            last_err = e
+            continue
+    raise last_err if last_err else UnexpectedError("DVRIP HTTP session failed")
+
+
+def _dvrip_http_attempt(url: str, user: str, password: str, timeout: float,
+                        send_command_header: bool) -> dict:
+    def post(payload: dict, msg_id: int, session: "str | None" = None) -> dict:
+        headers = {}
+        if send_command_header:
+            headers["Command"] = str(msg_id)
+        frame = json.dumps(payload).encode("utf-8")
+        raw, hdrs = _http_post_json(url, frame, timeout, session_id=session)
+        del hdrs
         try:
-            reply = json.loads(raw.decode("utf-8", errors="replace"))
+            return json.loads(raw.decode("utf-8", errors="replace"))
         except ValueError:
-            raise RouteError("camera answer was not valid DVRIP JSON") from None
-        body = reply.get("Body") if isinstance(reply, dict) else None
-        ret_code = body.get("Ret") if isinstance(body, dict) else None
-        ret_norm = str(ret_code).strip().lower() if ret_code is not None else ""
+            raise UnexpectedError("camera answer was not valid DVRIP JSON") from None
 
-        success_ret = (ret_code == 0 and ret_code is not False) \
-            or ret_norm in ("true", "ok")
-        if success_ret and _is_positive_login(reply):
-            pass  # terse success: harmless Ret plus a real session id
-        elif isinstance(ret_code, (int, float)) and not isinstance(ret_code, bool) \
-                and ret_code != 0:
-            raise AuthError("camera rejected the login (numeric Ret=%s)" % ret_code)
-        elif _is_auth_failure(reply):
-            raise AuthError("camera rejected the login (bad username/password)")
-        else:
-            raise AmbiguousAuthError(json.dumps(reply)[:200])
-        session = headers.get("SessionID") or _session_from([reply]) or "0x0"
-        info = extract_device_info(reply)
+    reply = post(dvr_login_body(user, password), CMD_LOGIN)
+    verdict = classify_login_reply(reply)
+    if verdict == "auth":
+        raise AuthError("camera rejected the login (bad username/password)")
+    if verdict not in ("ok", "terse"):
+        raise UnexpectedError(f"camera returned error code {reply.get('Ret')!r} "
+                              f"for the login")
+    session = _session_from([reply]) or "0x0"
+    info = extract_device_info(reply)
 
-        # Device-info probe (best-effort — reply tooling varies by firmware)
+    for name in ("SystemInfo", "NetWork.NetCommon", "General"):
         try:
-            qframe = dvr_frame(dvr_generic_body(1470), session)
-            raw2, _ = _http_post_json(url, qframe, timeout, session_id=session)
-            info2 = extract_device_info(json.loads(raw2.decode("utf-8", errors="replace")))
-            info.update(info2)
-        except (AuthError, RouteError, UnexpectedError, ValueError, OSError):
-            pass  # probe is best-effort; login reply fields already captured
-
-        # Logout
+            body = dvr_config_get_body(name)
+            body["SessionID"] = session
+            info.update(extract_device_info(post(body, CMD_CONFIG_GET, session)))
+        except (AuthError, RouteError, UnexpectedError):
+            continue
+    if not info.get("MACAddress"):
         try:
-            _http_post_json(url, dvr_frame(dvr_logout_body(), session), timeout,
-                            session_id=session)
+            body = dvr_config_get_body("NetWork.NetCommon")
+            body["SessionID"] = session
+            mac = _mac_from_netcommon(post(body, CMD_CONFIG_GET, session))
+            if mac:
+                info["MACAddress"] = mac
         except (AuthError, RouteError, UnexpectedError):
             pass
-        return info
-
-    # Plain JSON POST on each subpath; if a Digest challenge appears, retry
-    # that path with proper Digest auth before moving on.
-    for path in DVRIP_SUBPATHS:
-        try:
-            return attempt(path)
-        except AuthError as e:
-            if "401" not in str(e):
-                raise
-            # Digest challenge → try authenticated retry on the same path
-            try:
-                challenge = _probe_digest_challenge(ip, port, path, timeout)
-                if challenge:
-                    uri = path or "/"
-                    auth = _digest_authorization(challenge, user, password, "POST", uri)
-                    if auth:
-                        return attempt(path, digest=auth)
-            except (AuthError, RouteError, UnexpectedError):
-                raise
-            continue  # 401 without usable digest → try next subpath
-
-    raise AuthError("authentication failed on all DVRIP HTTP paths")
-
-
-def _probe_digest_challenge(ip: str, port: int, path: str, timeout: float) -> "str | None":
-    """A GET to elicit the WWW-Authenticate header (cheap, no login attempt)."""
-    url = f"http://{ip}:{port}{path}"
-    req = urllib.request.Request(url, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout):
-            return None
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
-            return e.headers.get("WWW-Authenticate")
-        return None
-    except (OSError, socket.timeout, TimeoutError):
-        return None
-
-
-# ── DVRIP over TCP (port 34567) ──────────────────────────────────────────────
-
-def dvrip_tcp_query(ip: str, port: int, user: str, password: str,
-                    timeout: float) -> dict:
-    """Full DVRIP session over raw TCP: login → probe → logout. Returns info dict."""
-    try:
-        sock = socket.create_connection((ip, port), timeout=timeout)
-    except OSError as e:
-        raise RouteError(f"could not connect ({e})") from None
-
-    def send(msg: dict, session: "str | None" = None):
-        sock.sendall(dvrip_tcp_frame(dvr_frame(msg, session)))
-
-    def recv_reply() -> dict:
-        try:
-            payload = _recv_tcp_frame(sock)
-        except (socket.timeout, TimeoutError):
-            raise RouteError("connection timed out waiting for reply") from None
-        return json.loads(payload.decode("utf-8", errors="replace"))
 
     try:
-        send(dvr_login_body(user, password))
-        reply = recv_reply()
-        body = reply.get("Body") if isinstance(reply, dict) else None
-        ret_code = body.get("Ret") if isinstance(body, dict) else None
-        ret_norm = str(ret_code).strip().lower() if ret_code is not None else ""
-
-        success_ret = (ret_code == 0 and ret_code is not False) \
-            or ret_norm in ("true", "ok")
-        if success_ret and _is_positive_login(reply):
-            pass
-        elif isinstance(ret_code, (int, float)) and not isinstance(ret_code, bool) \
-                and ret_code != 0:
-            raise AuthError("camera rejected the login (bad username/password)")
-        elif _is_auth_failure(reply):
-            raise AuthError("camera rejected the login (bad username/password)")
-        else:
-            raise AmbiguousAuthError(json.dumps(reply)[:200])
-        session = _session_from([reply]) or "0x0"
-        info = extract_device_info(reply)
-
-        try:
-            send(dvr_generic_body(1470), session)
-            info.update(extract_device_info(recv_reply()))
-        except (AuthError, RouteError, ValueError):
-            pass  # best-effort
-
-        try:
-            send(dvr_logout_body(), session)
-            recv_reply()
-        except (AuthError, RouteError, ValueError):
-            pass
-        return info
-    finally:
-        try:
-            sock.close()
-        except OSError:
-            pass
+        body = dvr_logout_body()
+        body["SessionID"] = session
+        post(body, CMD_LOGOUT, session)
+    except (AuthError, RouteError, UnexpectedError):
+        pass
+    return info
 
 
 # ── ONVIF SOAP (port 8899, last resort) ──────────────────────────────────────
@@ -502,7 +514,7 @@ def soap_request(url: str, user: str, password: str, body: str, timeout: float) 
     req = urllib.request.Request(
         url, data=envelope.encode("utf-8"), method="POST",
         headers={"Content-Type": 'application/soap+xml; charset=utf-8; action="http://www.onvif.org/ver10/device/wsdl/GetDeviceInformation"',
-                 "User-Agent": "tvt-camera-info/1.0"},
+                 "User-Agent": "tvt-camera-info/1.1"},
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -574,7 +586,7 @@ def arp_lookup(ip: str) -> "str | None":
 
 # ── Orchestration ─────────────────────────────────────────────────────────────
 
-PROTO_NAMES = {"http": "DVRIP over HTTP", "tcp": "DVRIP over TCP",
+PROTO_NAMES = {"tcp": "DVRIP over TCP", "http": "DVRIP over HTTP",
                "onvif": "ONVIF SOAP"}
 
 
@@ -587,10 +599,10 @@ def _run_proto(proto: str, ip: str, port: int, user: str, password: str,
     """
     label = PROTO_NAMES[proto]
     try:
-        if proto == "http":
-            info = dvrip_http_query(ip, port or DVRIP_HTTP_PORT, user, password, timeout)
-        elif proto == "tcp":
+        if proto == "tcp":
             info = dvrip_tcp_query(ip, port or DVRIP_TCP_PORT, user, password, timeout)
+        elif proto == "http":
+            info = dvrip_http_query(ip, port or DVRIP_HTTP_PORT, user, password, timeout)
         else:
             base = f"http://{ip}:{port or ONVIF_PORT}{ONVIF_PATH}"
             return onvif_get_device_information(base, user, password, timeout), \
@@ -598,9 +610,6 @@ def _run_proto(proto: str, ip: str, port: int, user: str, password: str,
         return info, None, label, "ok"
     except AuthError as e:
         return None, f"auth: {e}", label, "auth"
-    except AmbiguousAuthError as e:
-        return None, (f"auth-ambiguous: camera replied with a terse frame this tool "
-                      f"can't classify — reply started with: {e}"), label, "auth"
     except RouteError as e:
         return None, f"unreachable: {e}", label, "route"
     except UnexpectedError as e:
@@ -616,9 +625,9 @@ def main() -> None:
     p.add_argument("--password", default="", help="camera password")
     p.add_argument("--port", type=int, default=0,
                    help="override the port for the active transport "
-                        "(defaults: http=80, tcp=34567, onvif=8899)")
+                        "(defaults: tcp=34567, http=80, onvif=8899)")
     p.add_argument("--proto", default="auto", choices=["auto", "http", "tcp", "onvif"],
-                   help="which protocol(s) to try: auto tries http → tcp → onvif "
+                   help="which protocol(s) to try: auto tries tcp → http → onvif "
                         "(default: auto)")
     p.add_argument("--timeout", type=float, default=TIMEOUT_DEFAULT,
                    help="network timeout in seconds (default: 8)")
@@ -626,7 +635,7 @@ def main() -> None:
                    help="skip the initial ICMP reachability check")
     args = p.parse_args()
 
-    order = ["http", "tcp", "onvif"] if args.proto == "auto" else [args.proto]
+    order = ["tcp", "http", "onvif"] if args.proto == "auto" else [args.proto]
 
     if not is_valid_ipv4(args.ip):
         die(f"'{args.ip}' doesn't look like an IPv4 address — pass the camera's IP, "
@@ -690,18 +699,20 @@ def main() -> None:
                        "error": EXIT_UNEXPECTED}[failure_kinds[0]])
         sys.exit(EXIT_ALL_FAILED)
 
-    # MAC: prefer ONVIF's GetNetworkInterfaces; otherwise the ARP table
-    if not mac:
+    # MAC: prefer the protocol's own report; otherwise the local ARP table
+    if not info.get("MACAddress") and not mac:
         mac = arp_lookup(args.ip)
-        if mac:
-            mac += "  (from this PC's ARP table)"
 
     print("=" * 60)
     print(" CAMERA INFORMATION")
     print("=" * 60)
+    shown = set()
     for key, val in info.items():
+        if key.lower() == "macaddress":
+            continue
         print(f"  {key:<15}: {val}")
-    print(f"  {'MAC address':<15}: {mac or 'not found'}")
+        shown.add(key.lower())
+    print(f"  {'MAC address':<15}: {info.get('MACAddress') or mac or 'not found'}")
     print("=" * 60)
 
     serial = next((v for k, v in info.items() if k.lower() == "serialnumber"), None)
