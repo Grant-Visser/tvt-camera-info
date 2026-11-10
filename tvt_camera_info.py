@@ -228,7 +228,8 @@ def is_dvrip_header(frame: bytes) -> bool:
 DEVICE_INFO_KEYS = ("serialnumber", "manufacturer", "model", "firmware",
                     "firmwareversion", "devicename", "hardware",
                     "devicetype", "hardware", "hardwareversion",
-                    "softwareversion", "serialno", "macaddress")
+                    "softwareversion", "serialno", "macaddress",
+                    "sn", "mac")  # TVT XML API tag spellings (sn/mac)
 
 
 def extract_device_info(obj) -> dict:
