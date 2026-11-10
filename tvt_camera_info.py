@@ -69,6 +69,22 @@ def die(msg: str, code: int) -> "None":
     sys.exit(code)
 
 
+# ── Debug tracing (stderr only; --debug enables) ─────────────────────────────
+
+DEBUG = False
+
+
+def dbg(msg: str) -> None:
+    """One debug line to stderr; never touches normal stdout output."""
+    if DEBUG:
+        print(f"  [dbg] {msg}", file=sys.stderr, flush=True)
+
+
+def _redact(text: str) -> str:
+    """Mask anything that looks like Basic credentials in a header value."""
+    return re.sub(r"(Basic\s+)[A-Za-z0-9+/=]+", r"\1<redacted>", text or "")
+
+
 class AuthError(Exception):
     pass
 
@@ -118,6 +134,25 @@ def is_valid_ipv4(ip: str) -> bool:
         return False
 
 
+def scan_camera_ports(ip: str, timeout: float) -> "list[int]":
+    """Quick TCP connect sweep of the ports that matter in this device family
+    (HTTP/XML 80+8080, DVRIP 34567, TVT data 9008/6036, ONVIF 8899, others).
+    Returns the sorted list of open ports. Debug/diagnostic only."""
+    interesting = [80, 81, 8899, 8000, 8080, 8554, 9000, 9008, 9527, 9530,
+                   554, 6036, 34567, 34599, 49152]
+    open_ports: "list[int]" = []
+    for port in interesting:
+        try:
+            with socket.create_connection((ip, port), timeout=max(0.5, timeout / 2)):
+                open_ports.append(port)
+            dbg(f"portscan {ip}:{port} OPEN")
+        except (socket.timeout, TimeoutError):
+            dbg(f"portscan {ip}:{port} filtered/timeout")
+        except OSError as e:
+            dbg(f"portscan {ip}:{port} closed ({getattr(e, 'errno', '?')})")
+    return open_ports
+
+
 def ping_host(ip: str, timeout: float) -> "tuple[bool, str]":
     """
     Single ICMP ping before any auth is attempted.
@@ -154,10 +189,11 @@ def ping_host(ip: str, timeout: float) -> "tuple[bool, str]":
     if alive:
         return True, detail
 
-    # ICMP blocked ≠ camera absent: try a TCP connect on the DVRIP ports.
+    # ICMP blocked ≠ camera absent: try a TCP connect on known ports.
     for port in (DVRIP_TCP_PORT, DVRIP_HTTP_PORT):
         try:
             with socket.create_connection((ip, port), timeout=timeout):
+                dbg(f"ping fallback: TCP {port} open → treating host as alive")
                 return True, (f"ICMP blocked, but TCP port {port} is open — "
                               f"camera is up (ping is just firewalled)")
         except OSError:
@@ -426,26 +462,43 @@ def _mac_from_netcommon(reply: dict) -> "str | None":
 def _http_post_json(url: str, frame: bytes, timeout: float,
                     session_id: "str | None" = None,
                     auth_header: "str | None" = None,
-                    content_type: str = "application/json") -> "tuple[bytes, dict | None]":
+                    content_type: str = "application/json",
+                    method: str = "POST") -> "tuple[bytes, dict | None]":
     headers = {"Content-Type": content_type, "Connection": "keep-alive",
                "User-Agent": "tvt-camera-info/1.2"}
     if session_id:
         headers["SessionID"] = session_id
     if auth_header:
         headers["Authorization"] = auth_header
-    req = urllib.request.Request(url, data=frame, method="POST", headers=headers)
+    dbg(f"HTTP {method} {url}  auth={_redact(auth_header) if auth_header else 'none'} "
+        f"body={len(frame)}B")
+    req = urllib.request.Request(url, data=frame if method == "POST" else None,
+                                 method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read(), resp.headers
+            body_out = resp.read()
+            dbg(f"← {resp.status} ct={resp.headers.get('Content-Type', '?')} "
+                f"{len(body_out)}B: {body_out[:200]!r}")
+            return body_out, resp.headers
     except urllib.error.HTTPError as e:
+        body_out = b""
+        try:
+            body_out = e.read()
+        except Exception:
+            pass
+        dbg(f"← HTTP {e.code} WWW-Auth={_redact(e.headers.get('WWW-Authenticate', '') if e.headers else '')} "
+            f"Server={e.headers.get('Server', '?') if e.headers else '?'} "
+            f"body={body_out[:200]!r}")
         if e.code == 401:
             raise HttpAuthChallenge(e.headers.get("WWW-Authenticate", "") if e.headers else "") from None
         if e.code in (400, 403):
             raise AuthError(f"camera rejected the request (HTTP {e.code})") from None
         raise UnexpectedError(f"camera answered HTTP {e.code}") from None
     except (socket.timeout, TimeoutError):
+        dbg("← timeout")
         raise RouteError("connection timed out") from None
     except (ConnectionError, OSError) as e:
+        dbg(f"← connection failed: {e}")
         raise RouteError(f"could not connect ({e})") from None
 
 
@@ -461,14 +514,15 @@ def _auth_scheme_from_challenge(www_authenticate: str) -> str:
     return m.group(1).lower() if m else "basic"
 
 
-def _http_post_with_auth(url: str, body: bytes, user: str, password: str,
-                         timeout: float, content_type: str = "application/xml") -> bytes:
+def _http_request_with_auth(url: str, user: str, password: str, timeout: float,
+                            content_type: str = "application/xml",
+                            method: str = "POST") -> bytes:
     """
-    POST with HTTP-layer credentials, per the Provision-ISR HTTP API (auth
-    required on EVERY request; 401 + WWW-Authenticate when omitted). The
-    scheme comes from the camera's challenge — Basic is the documented
-    default; Digest is handled with the stdlib handler using the same
-    credentials (password never rides in a URL or query string).
+    HTTP request with layered credentials, per the Provision-ISR/TVT HTTP API
+    (auth required on EVERY request; 401 + WWW-Authenticate when omitted).
+    Sequence: unauthenticated probe → read the camera's challenge header →
+    retry with Basic (documented default) or Digest (stdlib handler, same
+    credentials — password never rides in a URL or query string).
     """
     challenges: "list[str]" = []
     for attempt in range(2):
@@ -476,19 +530,24 @@ def _http_post_with_auth(url: str, body: bytes, user: str, password: str,
             auth = None                     # first probe: no Authorization header
         else:
             scheme = _auth_scheme_from_challenge(" ".join(challenges))
+            dbg(f"challenge(s)={_redact(' '.join(challenges))!r} → retrying {method} with scheme={scheme}")
             if scheme == "digest":
                 mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
                 mgr.add_password(None, url, user, password)
                 opener = urllib.request.build_opener(
                     urllib.request.HTTPDigestAuthHandler(mgr))
                 req = urllib.request.Request(
-                    url, data=body, method="POST",
+                    url, data=b"" if method == "POST" else None, method=method,
                     headers={"Content-Type": content_type, "Connection": "keep-alive",
                              "User-Agent": "tvt-camera-info/1.2"})
                 try:
                     with opener.open(req, timeout=timeout) as resp:
-                        return resp.read()
+                        out = resp.read()
+                        dbg(f"← {resp.status} ({method}, digest) {len(out)}B: {out[:200]!r}")
+                        return out
                 except urllib.error.HTTPError as e:
+                    dbg(f"← digest retry HTTP {e.code} WWW-Auth="
+                        f"{_redact(e.headers.get('WWW-Authenticate', '') if e.headers else '')}")
                     raise HttpAuthChallenge(
                         e.headers.get("WWW-Authenticate", "") if e.headers else "") from None
                 except (socket.timeout, TimeoutError):
@@ -497,14 +556,29 @@ def _http_post_with_auth(url: str, body: bytes, user: str, password: str,
                     raise RouteError(f"could not connect ({e})") from None
             auth = _basic_auth_header(user, password)
         try:
-            raw, _hdrs = _http_post_json(url, body, timeout, auth_header=auth,
-                                         content_type=content_type)
+            raw, _hdrs = _http_post_json(url, b"", timeout, auth_header=auth,
+                                         content_type=content_type, method=method)
             return raw
         except HttpAuthChallenge as e:
             challenges.append(e.www_authenticate)
             if attempt == 1:
                 raise
     raise UnexpectedError("unreachable")  # pragma: no cover
+
+
+def _http_get_with_auth(url: str, body: bytes, user: str, password: str,
+                        timeout: float, content_type: str = "application/xml") -> bytes:
+    """GET variant — the vendor's own Postman collection uses GET; same
+    probe → challenge → Basic/Digest retry sequence."""
+    return _http_request_with_auth(url, user, password, timeout,
+                                   content_type=content_type, method="GET")
+
+
+def _http_post_with_auth(url: str, body: bytes, user: str, password: str,
+                         timeout: float, content_type: str = "application/xml") -> bytes:
+    """POST variant of the credentialed request (see _http_request_with_auth)."""
+    return _http_request_with_auth(url, user, password, timeout,
+                                   content_type=content_type, method="POST")
 
 
 def _xml_text_all(xml_bytes: bytes) -> dict:
@@ -539,13 +613,26 @@ def provision_xml_query(ip: str, port: int, user: str, password: str,
     info: dict = {}
     for command in ("GetDeviceInfo", "GetDeviceDetail", "GetNetBasicConfig"):
         url = f"{base}/{command}"
-        try:
-            raw = _http_post_with_auth(url, b"", user, password, timeout)
-        except HttpAuthChallenge as e:
-            raise AuthError(
-                "camera rejected the HTTP credentials (scheme: "
-                f"{_auth_scheme_from_challenge(e.www_authenticate) or 'basic'})") from None
-        except UnexpectedError:
+        # spec allows POST or GET; the vendor's own Postman collection uses
+        # GET, so GET first and fall back to POST for POST-only firmwares
+        raw: "bytes | None" = None
+        last_err: "Exception | None" = None
+        for fetch in (_http_get_with_auth, _http_post_with_auth):
+            try:
+                raw = fetch(url, b"", user, password, timeout)
+                break
+            except HttpAuthChallenge as e:
+                raise AuthError(
+                    "camera rejected the HTTP credentials (scheme: "
+                    f"{_auth_scheme_from_challenge(e.www_authenticate) or 'basic'})") from None
+            except (AuthError, RouteError):
+                raise
+            except UnexpectedError as e:
+                last_err = e
+                dbg(f"{command}: {fetch.__name__} failed ({e}); trying next method")
+                continue
+        if raw is None:
+            dbg(f"{command}: both GET and POST failed — skipping")
             continue
         fields = _xml_text_all(raw)
         for k, v in fields.items():
@@ -782,7 +869,17 @@ def main() -> None:
                    help="network timeout in seconds (default: 8)")
     p.add_argument("--no-ping", action="store_true",
                    help="skip the initial ICMP reachability check")
+    p.add_argument("--debug", action="store_true",
+                   help="print a wire-level trace of every connection, HTTP "
+                        "status, challenge header and reply snippet to stderr "
+                        "(credentials redacted) — for remote troubleshooting")
     args = p.parse_args()
+
+    global DEBUG
+    if args.debug:
+        DEBUG = True
+        dbg(f"tvt-camera-info debug trace — target={args.ip} proto={args.proto} "
+            f"user={args.user} timeout={args.timeout}s")
 
     order = ["tcp", "http", "xml", "onvif"] if args.proto == "auto" else [args.proto]
 
@@ -825,6 +922,17 @@ def main() -> None:
         print(f"  ✗ {label} failed ({mac})\n")
 
     if not info:
+        # Remote-debug aid: sweep the family's known ports once, after the
+        # protocol attempts, so the operator's paste shows the real port map.
+        if args.debug:
+            print("  running diagnostic port sweep (debug)...", flush=True)
+            open_ports = scan_camera_ports(args.ip, args.timeout)
+            if open_ports:
+                print(f"  → OPEN TCP ports on {args.ip}: "
+                      f"{', '.join(map(str, open_ports))}")
+            else:
+                print(f"  → no TCP ports open on {args.ip} out of the scanned "
+                      f"family set (80, 34567, 9008, 6036, 8899, ...)")
         print("=" * 60)
         print(" NO DEVICE INFORMATION RETURNED")
         print("=" * 60)

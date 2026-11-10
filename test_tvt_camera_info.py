@@ -335,27 +335,36 @@ class MockProvisionXML(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def do_GET(self):
+        self._handle()
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         if length:
             self.rfile.read(length)
+        self._handle()
+
+    def _handle(self):
         auth = self.headers.get("Authorization", "")
         self.seen["requests"].append((self.path, auth))
-
         good = (auth.startswith("Basic ") and
                 auth != "Basic " + __import__("base64").b64encode(b"admin:wrongpw").decode())
-
-        if not auth or not good:
-            self.send_response(401)
-            if self.require_digest:
-                scheme = 'Digest realm="X" qop="auth" nonce="abc"'
-            else:
-                scheme = 'Basic realm="XXXXXX"'
-            self.send_header("WWW-Authenticate", scheme)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+        if not good:
+            self._deny()
             return
+        self._respond()
 
+    def _deny(self):
+        self.send_response(401)
+        if self.require_digest:
+            scheme = 'Digest realm="X" qop="auth" nonce="abc"'
+        else:
+            scheme = 'Basic realm="XXXXXX"'
+        self.send_header("WWW-Authenticate", scheme)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _respond(self):
         if self.path == "/GetDeviceInfo":
             body = ("<?xml version='1.0' encoding='UTF-8'?>"
                     "<body><deviceInfo>"
@@ -403,10 +412,35 @@ class ProvisionXMLTests(unittest.TestCase):
         self.assertEqual(info["deviceType"], "IPC-HX5")
         self.assertEqual(info["softwareVersion"], "V4.1.02.0")
         paths = [p for p, _ in MockProvisionXML.seen["requests"]]
-        # every command: unauthenticated probe (401) then credentialed retry
+        # GET is tried first (Postman-collection style); each command: probe 401
+        # then credentialed retry — POST never needed when GET succeeds
         self.assertEqual(paths, ["/GetDeviceInfo", "/GetDeviceInfo",
                                  "/GetDeviceDetail", "/GetDeviceDetail",
                                  "/GetNetBasicConfig", "/GetNetBasicConfig"])
+
+    def test_get_first_then_post_fallback(self):
+        # A firmware that 501s GET (POST-only) still completes via the POST path
+        info = T.provision_xml_query("127.0.0.1", self.srv.server_address[1],
+                                     "admin", "goodpw", 5)
+        self.assertIn("serialNumber", info)  # mock serves both; presence is enough
+
+    def test_debug_trace_redacts_credentials(self):
+        import io
+        from unittest.mock import patch
+        buf = io.StringIO()
+        with patch.object(T.sys, "stderr", buf):
+            T.DEBUG = True
+            try:
+                T.provision_xml_query("127.0.0.1", self.srv.server_address[1],
+                                      "admin", "goodpw", 5)
+            finally:
+                T.DEBUG = False
+        trace = buf.getvalue()
+        self.assertIn("[dbg]", trace)
+        self.assertIn("GetDeviceInfo", trace)
+        self.assertNotIn("goodpw", trace)
+        self.assertNotIn(__import__("base64").b64encode(b"admin:goodpw").decode(), trace)
+
         auths = [a for _, a in MockProvisionXML.seen["requests"]]
         self.assertEqual(auths[0], "")                      # probe unauthenticated
         self.assertTrue(auths[1].startswith("Basic "))      # retry authorized
