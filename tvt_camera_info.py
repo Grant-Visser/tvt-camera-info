@@ -639,6 +639,29 @@ def provision_xml_query(ip: str, port: int, user: str, password: str,
             info.setdefault(k, v)
     if not info:
         raise UnexpectedError("camera returned no parseable XML device info")
+    # serial fallback: this API's device-info commands may not carry a serial
+    # tag (observed on TD-9423A3-LR ANPR firmware 5.1.1.0). Probe GetCaps for
+    # a SerialNumber/SN element, and otherwise derive from the device UUID
+    # (urn:uuid:<8-4-4-4-12 hex> — on this firmware family the middle groups
+    # are the serial printed on the unit's label).
+    if not any(k.lower() in ("serialnumber", "sn", "serialno") for k in info):
+        try:
+            url = f"{base}/GetCaps"
+            raw = _http_get_with_auth(url, b"", user, password, timeout)
+            caps = _xml_text_all(raw)
+            for k, v in caps.items():
+                if k.lower() in ("serialnumber", "sn", "serialno"):
+                    info[k] = v
+                    break
+        except (AuthError, RouteError, HttpAuthChallenge, UnexpectedError):
+            dbg("GetCaps probe unavailable")
+    uuid = info.get("UUID", "")
+    if not any(k.lower() in ("serialnumber", "sn", "serialno") for k in info):
+        m = re.match(r"urn:uuid:([0-9a-fA-F-]{36})$", uuid)
+        if m:
+            core = m.group(1).replace("-", "")
+            info["SerialNumber"] = f"{core[0:8]}-{core[8:12]}-{core[12:16]}"
+            dbg(f"serial derived from device UUID {uuid}")
     # normalize the XML "mac" tag to the MACAddress key used elsewhere
     mac = info.pop("mac", None) or info.pop("MAC", None)
     if mac and not info.get("MACAddress"):
@@ -835,9 +858,24 @@ def _run_proto(proto: str, ip: str, port: int, user: str, password: str,
         elif proto == "xml":
             info = provision_xml_query(ip, port or DVRIP_HTTP_PORT, user, password, timeout)
         else:
-            base = f"http://{ip}:{port or ONVIF_PORT}{ONVIF_PATH}"
-            return onvif_get_device_information(base, user, password, timeout), \
-                   onvif_get_network_interfaces(base, user, password, timeout), label, "ok"
+            # ONVIF may live on 8899 (legacy default) or be served by the
+            # main web service on port 80 (common on modern TVT IPC firmware
+            # that advertises onvifVer). Try both before giving up.
+            candidates = [(port or ONVIF_PORT, ONVIF_PATH)]
+            if (port or ONVIF_PORT) != DVRIP_HTTP_PORT:
+                candidates.append((DVRIP_HTTP_PORT, ONVIF_PATH))
+            last_exc: "Exception | None" = None
+            for onvif_port, onvif_path in candidates:
+                base = f"http://{ip}:{onvif_port}{onvif_path}"
+                try:
+                    dbg(f"ONVIF attempt: {base}")
+                    return onvif_get_device_information(base, user, password, timeout), \
+                        onvif_get_network_interfaces(base, user, password, timeout), \
+                        label, "ok"
+                except (AuthError, RouteError, UnexpectedError) as e:
+                    last_exc = e
+                    dbg(f"ONVIF {base} failed: {e}")
+            raise last_exc if last_exc else UnexpectedError("ONVIF unavailable")
         return info, None, label, "ok"
     except AuthError as e:
         return None, f"auth: {e}", label, "auth"
