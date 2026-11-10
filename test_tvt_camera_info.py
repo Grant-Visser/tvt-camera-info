@@ -309,17 +309,139 @@ class HttpTransportTests(unittest.TestCase):
         finally:
             srv.shutdown()
 
-    def test_http_auth_failure_raises(self):
+    def test_http_auth_challenge_raises_auth_challenge(self):
+        # 401 with no usable JSON reply → HttpAuthChallenge (the XML transport
+        # in auto order is what answers challenges with credentials)
         MockDvripHTTP.reject = True
         srv = ThreadingHTTPServer(("127.0.0.1", 0), MockDvripHTTP)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:
-            with self.assertRaises(T.AuthError):
+            with self.assertRaises(T.HttpAuthChallenge):
                 T.dvrip_http_query("127.0.0.1", srv.server_address[1],
                                    "admin", "x", 5)
         finally:
             srv.shutdown()
             MockDvripHTTP.reject = False
+
+
+# ── Provision-ISR XML API (HTTP Basic/Digest, command in URL path) ───────────
+
+class MockProvisionXML(BaseHTTPRequestHandler):
+    """Speaks the official Provision-ISR HTTP API v1.9 shape: 401 +
+    WWW-Authenticate when unauthenticated; XML when authorized."""
+    seen = {"requests": []}
+    require_digest = False
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length:
+            self.rfile.read(length)
+        auth = self.headers.get("Authorization", "")
+        self.seen["requests"].append((self.path, auth))
+
+        good = (auth.startswith("Basic ") and
+                auth != "Basic " + __import__("base64").b64encode(b"admin:wrongpw").decode())
+
+        if not auth or not good:
+            self.send_response(401)
+            if self.require_digest:
+                scheme = 'Digest realm="X" qop="auth" nonce="abc"'
+            else:
+                scheme = 'Basic realm="XXXXXX"'
+            self.send_header("WWW-Authenticate", scheme)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if self.path == "/GetDeviceInfo":
+            body = ("<?xml version='1.0' encoding='UTF-8'?>"
+                    "<body><deviceInfo>"
+                    "<deviceDescription>IPCamera</deviceDescription>"
+                    "<deviceType>IPC-HX5</deviceType>"
+                    "<serialNumber>SN-XML-0001</serialNumber>"
+                    "<hardwareVersion>V1.2</hardwareVersion>"
+                    "<softwareVersion>V4.1.02.0</softwareVersion>"
+                    "<videoInCount>1</videoInCount>"
+                    "</deviceInfo></body>")
+        elif self.path == "/GetDeviceDetail":
+            body = ("<body><deviceDetail><supportPtz>true</supportPtz>"
+                    "<supportTalk>false</supportTalk></deviceDetail></body>")
+        elif self.path == "/GetNetBasicConfig":
+            body = ("<body><netBasic><tcpIp><mac>00:12:3F:AB:CD:EF</mac>"
+                    "<dhcp>true</dhcp></tcpIp></netBasic></body>")
+        else:
+            self.send_response(400)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        data = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/xml; charset='UTF-8'")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+class ProvisionXMLTests(unittest.TestCase):
+
+    def setUp(self):
+        MockProvisionXML.seen = {"requests": []}
+        MockProvisionXML.require_digest = False
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), MockProvisionXML)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+
+    def test_401_challenge_then_basic_success(self):
+        info = T.provision_xml_query("127.0.0.1", self.srv.server_address[1],
+                                     "admin", "goodpw", 5)
+        self.assertEqual(info["serialNumber"], "SN-XML-0001")
+        self.assertEqual(info["deviceType"], "IPC-HX5")
+        self.assertEqual(info["softwareVersion"], "V4.1.02.0")
+        paths = [p for p, _ in MockProvisionXML.seen["requests"]]
+        # every command: unauthenticated probe (401) then credentialed retry
+        self.assertEqual(paths, ["/GetDeviceInfo", "/GetDeviceInfo",
+                                 "/GetDeviceDetail", "/GetDeviceDetail",
+                                 "/GetNetBasicConfig", "/GetNetBasicConfig"])
+        auths = [a for _, a in MockProvisionXML.seen["requests"]]
+        self.assertEqual(auths[0], "")                      # probe unauthenticated
+        self.assertTrue(auths[1].startswith("Basic "))      # retry authorized
+        self.assertTrue(all(a.startswith("Basic ") for a in auths[1::2]))
+        self.assertTrue(all(a == "" for a in auths[::2]))
+        self.assertNotIn("goodpw", str(MockProvisionXML.seen))  # never in URL/path
+
+    def test_bad_credentials_surface_as_auth_error(self):
+        with self.assertRaises(T.AuthError):
+            T.provision_xml_query("127.0.0.1", self.srv.server_address[1],
+                                  "admin", "wrongpw", 5)
+
+    def test_digest_challenge_detected_and_attempted(self):
+        MockProvisionXML.require_digest = True
+        # Our mock can't validate real RFC2617 digest responses, so assert the
+        # scheme selection only — the real handler is urllib's HTTPDigestAuthHandler.
+        self.assertEqual(T._auth_scheme_from_challenge(
+            'Digest realm="X" qop="auth" nonce="abc"'), "digest")
+        self.assertEqual(T._auth_scheme_from_challenge(
+            'Basic realm="XXXXXX"'), "basic")
+        self.assertEqual(T._auth_scheme_from_challenge(""), "basic")
+
+    def test_xml_flatten_leaf_tags(self):
+        fields = T._xml_text_all(
+            b"<body><deviceInfo><serialNumber>SN-1</serialNumber>"
+            b"<nested><deep>2</deep></nested></deviceInfo></body>")
+        self.assertEqual(fields, {"serialNumber": "SN-1", "deep": "2"})
+
+    def test_route_error_on_closed_port(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        with self.assertRaises(T.RouteError):
+            T.provision_xml_query("127.0.0.1", port, "admin", "x", 2)
 
 
 if __name__ == "__main__":

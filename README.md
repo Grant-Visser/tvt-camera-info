@@ -80,54 +80,71 @@ python tvt_camera_info.py --ip 192.168.1.64 --password YourCameraPassword
 
 ### How it talks to the camera (attempt order)
 
-By default the tool tries three protocols, in this order, and prints the
+By default the tool tries four protocols, in this order, and prints the
 result of the first one that works:
 
-1. **DVRIP over TCP (port 34567)** — the camera's native "NetSurveillance"
-   (DVRIP/Sofia) protocol. The camera's model/serial/firmware/MAC are returned
-   as JSON. This is what these devices actually speak.
-2. **DVRIP over HTTP (port 80)** — the web service relaying the same JSON, for
-   devices where the raw TCP service is firewalled.
-3. **ONVIF (port 8899)** — the open camera standard. **Last resort only** —
+1. **DVRIP over TCP (port 34567)** — the native "NetSurveillance"
+   (DVRIP/Sofia) JSON protocol, framed in binary. Used by Xiongmai-style
+   firmwares and some TVT-family NVRs.
+2. **DVRIP over HTTP (port 80)** — the same JSON relayed over the web
+   service, for devices where the raw TCP service is firewalled.
+3. **Provision-ISR XML API (HTTP, port 80)** — the vendor's official HTTP API
+   ("HTTP API Protocol User Guide v1.9"): the command is the URL path
+   (`/GetDeviceInfo`, `/GetDeviceDetail`), and every request must carry HTTP
+   **Basic** (or Digest) auth — the same username and password that work on
+   the camera's web page. This is what answers "401 authentication failure"
+   when a request arrives without credentials, which is why older versions of
+   this tool reported "authentication failed" with a perfectly valid password.
+   The password travels only inside the HTTP `Authorization` header, and if
+   the camera demands Digest auth the password is hashed on the wire.
+4. **ONVIF (port 8899)** — the open camera standard. **Last resort only** —
    many of these cameras ship with ONVIF disabled.
 
-The password is **never sent in plaintext**: it is sent as the protocol's
-required "sofia hash" (an MD5-derived digest), and special characters are
-safe — the hash step is exactly what the camera expects. Quote complex
-passwords on the command line: `--password "YourPassword!"`
+Note: TVT-family devices also have a proprietary "data port" (**9008** on
+cameras, **6036** on NVRs) used by the vendor's own SDK and phone apps. That
+protocol is a binary vendor SDK, not documented for plain-HTTP clients, so
+this tool does not probe it.
+
+The DVRIP password is **never sent in plaintext**: it is sent as the
+protocol's required "sofia hash" (an MD5-derived digest), and special
+characters are safe — the hash step is exactly what the camera expects. On
+the XML API the credentials ride in the HTTP auth header, the same way your
+browser does it. Either way, quote complex passwords on the command line:
+`--password "YourPassword!"`
 
 Optional flags:
 
 ```bash
---proto http       # force one protocol only: http | tcp | onvif | auto
+--proto xml        # force one protocol only: auto | tcp | http | xml | onvif
 --port 80          # override the port for the active transport
-                   # (defaults: HTTP=80, TCP=34567, ONVIF=8899)
+                   # (defaults: HTTP/XML=80, TCP=34567, ONVIF=8899)
 --user admin       # username, only change if it isn't 'admin'
 --timeout 8        # seconds to wait for the camera
 ```
 
-For example, to try only the native protocol over HTTP:
+For example, to try only the official XML API:
 
 ```bash
-python tvt_camera_info.py --ip 192.168.1.64 --proto http --password secret
+python tvt_camera_info.py --ip 192.168.1.64 --proto xml --password secret
 ```
 
 ### Example output (DVRIP)
 
 ```
-Querying camera at 192.168.1.64 — protocol(s): DVRIP over HTTP, DVRIP over TCP, ONVIF SOAP
+Querying camera at 192.168.1.64 — protocol(s): DVRIP over HTTP, DVRIP over TCP, Provision-ISR XML API (HTTP), ONVIF SOAP
 
   trying DVRIP over HTTP...
-  ✓ DVRIP over HTTP answered
+  ✗ DVRIP over HTTP failed (...)
+  trying Provision-ISR XML API (HTTP)...
+  ✓ Provision-ISR XML API (HTTP) answered
 
 ============================================================
  CAMERA INFORMATION
 ============================================================
-  SerialNumber    : 4C09B6PA8888123456
-  Manufacturer    : TVT
-  Model           : NV-4032RX
-  Firmware        : V5.0.R12.12345678
-  MAC address     : 8C:30:66:98:0C:06
+  serialNumber   : 4C09B6PA8888123456
+  deviceType     : IPC-HX5
+  softwareVersion: V4.1.02.0
+  MAC address    : 8C:30:66:98:0C:06
 ============================================================
 ```
 

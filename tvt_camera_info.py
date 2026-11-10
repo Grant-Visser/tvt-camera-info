@@ -7,8 +7,17 @@ These devices speak DVRIP ("NetSurveillance" / "Sofia") — a JSON protocol
 sent as length-prefixed binary frames. Login is command 1000 with a
 "sofia hash" of the password (never plaintext). Attempt order (auto):
   1. TCP   DVRIP on port 34567   (the protocol's native transport)
-  2. HTTP  DVRIP on port 80      (the web service relays the same JSON)
+  2. HTTP  port 80, two documented shapes in this device family:
+       a. DVRIP JSON relay at "/"          (Xiongmai-style firmwares)
+       b. Provision-ISR XML API: command in the URL path (/GetDeviceInfo, …)
+          with mandatory HTTP Basic/Digest auth on every request
+          (official "HTTP API Protocol User Guide v1.9", 2020-05 — this is
+          what answers 401 + WWW-Authenticate when unauthenticated)
   3. ONVIF SOAP on port 8899     (last resort — often disabled on these cameras)
+
+TVT-family "data port" 9008 / NVR 6036 serve the vendor's proprietary
+NET_SDK binary protocol (libdvrnetsdk); they are not the DVRIP JSON port and
+are intentionally not probed by this stdlib-only tool.
 
 The MAC is cross-checked against the local ARP table when a protocol doesn't
 report one. Works on Windows, Linux and macOS. Python 3.8+, standard library
@@ -16,6 +25,7 @@ only.
 """
 
 import argparse
+import base64
 import hashlib
 import html
 import json
@@ -27,6 +37,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 
 # ── Exit codes ────────────────────────────────────────────────────────────────
 EXIT_OK = 0
@@ -40,6 +51,8 @@ TIMEOUT_DEFAULT = 8.0
 DVRIP_HTTP_PORT = 80
 DVRIP_TCP_PORT = 34567
 ONVIF_PORT = 8899
+# TVT/Provision "data port" — vendor NET_SDK protocol, not DVRIP (see module docstring)
+TVT_DATA_PORT = 9008
 
 ONVIF_PATH = "/onvif/device_service"
 
@@ -66,6 +79,14 @@ class RouteError(Exception):
 
 class UnexpectedError(Exception):
     pass
+
+
+class HttpAuthChallenge(Exception):
+    """HTTP 401 persisted even after a credentialed retry."""
+
+    def __init__(self, www_authenticate: str = ""):
+        super().__init__("HTTP authentication failed")
+        self.www_authenticate = www_authenticate or ""
 
 
 # ── DVRIP password hashing ────────────────────────────────────────────────────
@@ -402,17 +423,23 @@ def _mac_from_netcommon(reply: dict) -> "str | None":
 # ── HTTP transport (the web service relays the same JSON, port 80) ────────────
 
 def _http_post_json(url: str, frame: bytes, timeout: float,
-                    session_id: "str | None" = None) -> "tuple[bytes, dict | None]":
-    headers = {"Content-Type": "application/json", "Connection": "keep-alive",
-               "User-Agent": "tvt-camera-info/1.1"}
+                    session_id: "str | None" = None,
+                    auth_header: "str | None" = None,
+                    content_type: str = "application/json") -> "tuple[bytes, dict | None]":
+    headers = {"Content-Type": content_type, "Connection": "keep-alive",
+               "User-Agent": "tvt-camera-info/1.2"}
     if session_id:
         headers["SessionID"] = session_id
+    if auth_header:
+        headers["Authorization"] = auth_header
     req = urllib.request.Request(url, data=frame, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read(), resp.headers
     except urllib.error.HTTPError as e:
-        if e.code in (401, 400, 403):
+        if e.code == 401:
+            raise HttpAuthChallenge(e.headers.get("WWW-Authenticate", "") if e.headers else "") from None
+        if e.code in (400, 403):
             raise AuthError(f"camera rejected the request (HTTP {e.code})") from None
         raise UnexpectedError(f"camera answered HTTP {e.code}") from None
     except (socket.timeout, TimeoutError):
@@ -421,12 +448,120 @@ def _http_post_json(url: str, frame: bytes, timeout: float,
         raise RouteError(f"could not connect ({e})") from None
 
 
+def _basic_auth_header(user: str, password: str) -> str:
+    token = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
+
+
+def _auth_scheme_from_challenge(www_authenticate: str) -> str:
+    """"Basic" or "digest" from a WWW-Authenticate header; Basic is the
+    documented default for the Provision-ISR API (User Guide v1.9 §1.3.3)."""
+    m = re.search(r"\b(basic|digest)\b", www_authenticate or "", re.IGNORECASE)
+    return m.group(1).lower() if m else "basic"
+
+
+def _http_post_with_auth(url: str, body: bytes, user: str, password: str,
+                         timeout: float, content_type: str = "application/xml") -> bytes:
+    """
+    POST with HTTP-layer credentials, per the Provision-ISR HTTP API (auth
+    required on EVERY request; 401 + WWW-Authenticate when omitted). The
+    scheme comes from the camera's challenge — Basic is the documented
+    default; Digest is handled with the stdlib handler using the same
+    credentials (password never rides in a URL or query string).
+    """
+    challenges: "list[str]" = []
+    for attempt in range(2):
+        if attempt == 0:
+            auth = None                     # first probe: no Authorization header
+        else:
+            scheme = _auth_scheme_from_challenge(" ".join(challenges))
+            if scheme == "digest":
+                mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+                mgr.add_password(None, url, user, password)
+                opener = urllib.request.build_opener(
+                    urllib.request.HTTPDigestAuthHandler(mgr))
+                req = urllib.request.Request(
+                    url, data=body, method="POST",
+                    headers={"Content-Type": content_type, "Connection": "keep-alive",
+                             "User-Agent": "tvt-camera-info/1.2"})
+                try:
+                    with opener.open(req, timeout=timeout) as resp:
+                        return resp.read()
+                except urllib.error.HTTPError as e:
+                    raise HttpAuthChallenge(
+                        e.headers.get("WWW-Authenticate", "") if e.headers else "") from None
+                except (socket.timeout, TimeoutError):
+                    raise RouteError("connection timed out") from None
+                except (ConnectionError, OSError) as e:
+                    raise RouteError(f"could not connect ({e})") from None
+            auth = _basic_auth_header(user, password)
+        try:
+            raw, _hdrs = _http_post_json(url, body, timeout, auth_header=auth,
+                                         content_type=content_type)
+            return raw
+        except HttpAuthChallenge as e:
+            challenges.append(e.www_authenticate)
+            if attempt == 1:
+                raise
+    raise UnexpectedError("unreachable")  # pragma: no cover
+
+
+def _xml_text_all(xml_bytes: bytes) -> dict:
+    """Flatten an XML document to {tag: text} (leaf elements only,
+    namespace-agnostic). Tags keep their case as found."""
+    out: dict = {}
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return out
+    stack = [root]
+    while stack:
+        el = stack.pop()
+        tag = el.tag.split("}")[-1]
+        if tag not in out and el.text and el.text.strip() and len(list(el)) == 0:
+            out[tag] = el.text.strip()
+        stack.extend(el)
+    return out
+
+
+def provision_xml_query(ip: str, port: int, user: str, password: str,
+                        timeout: float) -> dict:
+    """
+    Provision-ISR / TVT official XML-over-HTTP API ("HTTP API Protocol User
+    Guide v1.9", 2020-05): the command is the URL path, HTTP Basic (or Digest)
+    auth is required on every request, bodies are XML, and an unauthenticated
+    request draws 401 + WWW-Authenticate — exactly the observed "401
+    authentication failure". Device info via GetDeviceInfo + GetDeviceDetail
+    (+ GetNetBasicConfig for network details).
+    """
+    base = f"http://{ip}:{port}"
+    info: dict = {}
+    for command in ("GetDeviceInfo", "GetDeviceDetail", "GetNetBasicConfig"):
+        url = f"{base}/{command}"
+        try:
+            raw = _http_post_with_auth(url, b"", user, password, timeout)
+        except HttpAuthChallenge as e:
+            raise AuthError(
+                "camera rejected the HTTP credentials (scheme: "
+                f"{_auth_scheme_from_challenge(e.www_authenticate) or 'basic'})") from None
+        except UnexpectedError:
+            continue
+        fields = _xml_text_all(raw)
+        for k, v in fields.items():
+            info.setdefault(k, v)
+    if not info:
+        raise UnexpectedError("camera returned no parseable XML device info")
+    # normalize the XML "mac" tag to the MACAddress key used elsewhere
+    mac = info.pop("mac", None) or info.pop("MAC", None)
+    if mac and not info.get("MACAddress"):
+        info["MACAddress"] = mac
+    return info
+
+
 def dvrip_http_query(ip: str, port: int, user: str, password: str,
                      timeout: float) -> dict:
     """
-    The camera's HTTP service relays the same DVRIP JSON: each POST carries one
-    command's JSON body; the numeric command rides in a Command header when the
-    firmware honours it, and the reply is the same JSON as over TCP.
+    Xiongmai-style DVRIP JSON relay at "/" — kept for firmwares that expose it.
     """
     url = f"http://{ip}:{port}/"
     last_err: "Exception | None" = None
@@ -438,6 +573,11 @@ def dvrip_http_query(ip: str, port: int, user: str, password: str,
                 return info
             last_err = UnexpectedError("camera returned empty device info")
         except AuthError:
+            raise
+        except HttpAuthChallenge:
+            # The JSON relay exists but sits behind HTTP-layer auth → this
+            # firmware's port 80 is the XML-API shape; let the xml transport
+            # (next in auto order) handle the challenge with its own scheme.
             raise
         except (RouteError, UnexpectedError) as e:
             last_err = e
@@ -452,7 +592,8 @@ def _dvrip_http_attempt(url: str, user: str, password: str, timeout: float,
         if send_command_header:
             headers["Command"] = str(msg_id)
         frame = json.dumps(payload).encode("utf-8")
-        raw, hdrs = _http_post_json(url, frame, timeout, session_id=session)
+        raw, hdrs = _http_post_json(url, frame, timeout, session_id=session,
+                                    content_type="application/json")
         del hdrs
         try:
             return json.loads(raw.decode("utf-8", errors="replace"))
@@ -587,7 +728,7 @@ def arp_lookup(ip: str) -> "str | None":
 # ── Orchestration ─────────────────────────────────────────────────────────────
 
 PROTO_NAMES = {"tcp": "DVRIP over TCP", "http": "DVRIP over HTTP",
-               "onvif": "ONVIF SOAP"}
+               "xml": "Provision-ISR XML API (HTTP)", "onvif": "ONVIF SOAP"}
 
 
 def _run_proto(proto: str, ip: str, port: int, user: str, password: str,
@@ -603,6 +744,8 @@ def _run_proto(proto: str, ip: str, port: int, user: str, password: str,
             info = dvrip_tcp_query(ip, port or DVRIP_TCP_PORT, user, password, timeout)
         elif proto == "http":
             info = dvrip_http_query(ip, port or DVRIP_HTTP_PORT, user, password, timeout)
+        elif proto == "xml":
+            info = provision_xml_query(ip, port or DVRIP_HTTP_PORT, user, password, timeout)
         else:
             base = f"http://{ip}:{port or ONVIF_PORT}{ONVIF_PATH}"
             return onvif_get_device_information(base, user, password, timeout), \
@@ -610,6 +753,10 @@ def _run_proto(proto: str, ip: str, port: int, user: str, password: str,
         return info, None, label, "ok"
     except AuthError as e:
         return None, f"auth: {e}", label, "auth"
+    except HttpAuthChallenge as e:
+        # HTTP-layer auth persisted after a credentialed retry
+        return None, ("auth: HTTP 401 after credentialed retry "
+                      f"(challenge: {e.www_authenticate or 'none reported'})"), label, "auth"
     except RouteError as e:
         return None, f"unreachable: {e}", label, "route"
     except UnexpectedError as e:
@@ -625,17 +772,18 @@ def main() -> None:
     p.add_argument("--password", default="", help="camera password")
     p.add_argument("--port", type=int, default=0,
                    help="override the port for the active transport "
-                        "(defaults: tcp=34567, http=80, onvif=8899)")
-    p.add_argument("--proto", default="auto", choices=["auto", "http", "tcp", "onvif"],
-                   help="which protocol(s) to try: auto tries tcp → http → onvif "
-                        "(default: auto)")
+                        "(defaults: tcp=34567, http/xml=80, onvif=8899)")
+    p.add_argument("--proto", default="auto",
+                   choices=["auto", "http", "xml", "tcp", "onvif"],
+                   help="which protocol(s) to try: auto tries tcp → http → xml → "
+                        "onvif (default: auto)")
     p.add_argument("--timeout", type=float, default=TIMEOUT_DEFAULT,
                    help="network timeout in seconds (default: 8)")
     p.add_argument("--no-ping", action="store_true",
                    help="skip the initial ICMP reachability check")
     args = p.parse_args()
 
-    order = ["tcp", "http", "onvif"] if args.proto == "auto" else [args.proto]
+    order = ["tcp", "http", "xml", "onvif"] if args.proto == "auto" else [args.proto]
 
     if not is_valid_ipv4(args.ip):
         die(f"'{args.ip}' doesn't look like an IPv4 address — pass the camera's IP, "
