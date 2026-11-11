@@ -642,9 +642,9 @@ def provision_xml_query(ip: str, port: int, user: str, password: str,
         raise UnexpectedError("camera returned no parseable XML device info")
     # serial fallback: this API's device-info commands may not carry a serial
     # tag (observed on TD-9423A3-LR ANPR firmware 5.1.1.0). Probe GetCaps for
-    # a SerialNumber/SN element, and otherwise derive from the device UUID
-    # (urn:uuid:<8-4-4-4-12 hex> — on this firmware family the middle groups
-    # are the serial printed on the unit's label).
+    # a SerialNumber/SN element. If the device reports no serial anywhere, the
+    # field is omitted — never derived or synthesized from the UUID or anything
+    # else; a later transport (ONVIF) may still report the real one.
     if not any(k.lower() in ("serialnumber", "sn", "serialno") for k in info):
         try:
             url = f"{base}/GetCaps"
@@ -656,13 +656,8 @@ def provision_xml_query(ip: str, port: int, user: str, password: str,
                     break
         except (AuthError, RouteError, HttpAuthChallenge, UnexpectedError):
             dbg("GetCaps probe unavailable")
-    uuid = info.get("UUID", "")
     if not any(k.lower() in ("serialnumber", "sn", "serialno") for k in info):
-        m = re.match(r"urn:uuid:([0-9a-fA-F-]{36})$", uuid)
-        if m:
-            core = m.group(1).replace("-", "")
-            info["SerialNumber"] = f"{core[0:8]}-{core[8:12]}-{core[12:16]}"
-            dbg(f"serial derived from device UUID {uuid}")
+        dbg("device reported no serial on this API — omitting SerialNumber")
     # normalize the XML "mac" tag to the MACAddress key used elsewhere
     mac = info.pop("mac", None) or info.pop("MAC", None)
     if mac and not info.get("MACAddress"):
@@ -992,16 +987,35 @@ def main() -> None:
             sys.exit(EXIT_NO_ROUTE)
 
     info = mac = label = None
+    held_info = held_mac = held_label = None
     for proto in order:
         print(f"  trying {PROTO_NAMES[proto]}...", flush=True)
         info, mac, label, kind = _run_proto(proto, args.ip, args.port, args.user,
                                             args.password, args.timeout)
-        if info:
+        if info and any(k.lower() == "serialnumber" for k in info):
             print(f"  ✓ {label} answered\n")
             break
+        if info:
+            # The transport answered but did not report a serial: keep trying
+            # the remaining transports rather than stopping here. A serial is
+            # only ever printed when the device itself reported it.
+            print(f"  ✓ {label} answered (no serial reported)\n")
+            failures.append(f"{label}: answered but did not report a serial")
+            failure_kinds.append(kind)
+            if held_info is None:
+                held_info, held_mac, held_label = info, mac, label
+            info = None
+            continue
         failures.append(f"{label}: {mac}")
         failure_kinds.append(kind)
         print(f"  ✗ {label} failed ({mac})\n")
+
+    if info is None and held_info is not None:
+        # No transport reported a serial: show the best device info we did
+        # get, with the serial honestly omitted (the NOTE below explains).
+        info, mac, label = held_info, held_mac, held_label
+        print(f"  (no transport reported a serial — showing {label} info "
+              f"without one)\n")
 
     if not info:
         # Remote-debug aid: sweep the family's known ports once, after the
@@ -1035,7 +1049,8 @@ def main() -> None:
         # auto (all three) → 3 (all protocols unavailable)
         if len(order) == 1 and failure_kinds:
             sys.exit({"auth": EXIT_AUTH, "route": EXIT_NO_ROUTE,
-                       "error": EXIT_UNEXPECTED}[failure_kinds[0]])
+                      "error": EXIT_UNEXPECTED,
+                      "ok": EXIT_UNEXPECTED}.get(failure_kinds[0], EXIT_UNEXPECTED))
         sys.exit(EXIT_ALL_FAILED)
 
     # MAC: prefer the protocol's own report; otherwise the local ARP table
@@ -1056,8 +1071,9 @@ def main() -> None:
 
     serial = next((v for k, v in info.items() if k.lower() == "serialnumber"), None)
     if not serial:
-        print("\nNOTE: this camera did not report a serial number.")
-        print("      Try its web UI (Settings → Version/Info) or the label on the unit.")
+        print("\nNOTE: no transport reported a serial number for this camera.")
+        print("      It is deliberately omitted rather than derived. Try the")
+        print("      web UI (Settings → Version/Info) or the label on the unit.")
         sys.exit(EXIT_ALL_FAILED)
 
     sys.exit(EXIT_OK)
