@@ -13,7 +13,8 @@ sent as length-prefixed binary frames. Login is command 1000 with a
           with mandatory HTTP Basic/Digest auth on every request
           (official "HTTP API Protocol User Guide v1.9", 2020-05 — this is
           what answers 401 + WWW-Authenticate when unauthenticated)
-  3. ONVIF SOAP on port 8899     (last resort — often disabled on these cameras)
+  3. ONVIF SOAP on ports 80, then 8899 (last resort — often disabled; modern
+     firmware serves it on the web port with HTTP Basic/Digest auth)
 
 TVT-family "data port" 9008 / NVR 6036 serve the vendor's proprietary
 NET_SDK binary protocol (libdvrnetsdk); they are not the DVRIP JSON port and
@@ -747,11 +748,19 @@ def _dvrip_http_attempt(url: str, user: str, password: str, timeout: float,
     return info
 
 
-# ── ONVIF SOAP (port 8899, last resort) ──────────────────────────────────────
+# ── ONVIF SOAP (legacy 8899 / port 80, last resort) ──────────────────────────
 
-def soap_request(url: str, user: str, password: str, body: str, timeout: float) -> str:
-    """POST a raw SOAP envelope with WS-UsernameToken auth; return response text."""
-    envelope = f"""<?xml version="1.0" encoding="UTF-8"?>
+def soap_request(url: str, user: str, password: str, body: str,
+                 timeout: float) -> str:
+    """
+    POST a raw SOAP envelope with WS-UsernameToken auth; return response text.
+    Modern TVT/Provision-ISR IPC firmware serves ONVIF on the main web port
+    with HTTP Basic/Digest auth (challenge first) instead of WS-Security
+    headers — mirror the XML transport's probe → challenge → credentialed
+    retry, and fall back to WS-UsernameToken for legacy 8899 services.
+    """
+    def envelope() -> str:
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
   <s:Header>
     <Security xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -763,22 +772,57 @@ def soap_request(url: str, user: str, password: str, body: str, timeout: float) 
   </s:Header>
   <s:Body>{body}</s:Body>
 </s:Envelope>"""
-    req = urllib.request.Request(
-        url, data=envelope.encode("utf-8"), method="POST",
-        headers={"Content-Type": 'application/soap+xml; charset=utf-8; action="http://www.onvif.org/ver10/device/wsdl/GetDeviceInformation"',
-                 "User-Agent": "tvt-camera-info/1.1"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 400, 403):
-            raise AuthError(f"camera rejected the request (HTTP {e.code})") from None
-        raise UnexpectedError(f"camera answered HTTP {e.code}") from None
-    except (socket.timeout, TimeoutError):
-        raise RouteError("connection timed out") from None
-    except (ConnectionError, OSError) as e:
-        raise RouteError(f"could not connect ({e})") from None
+    last_challenge = ""
+    for attempt in range(2):
+        headers = {
+            "Content-Type": 'application/soap+xml; charset=utf-8; '
+                            'action="http://www.onvif.org/ver10/device/wsdl/GetDeviceInformation"',
+            "User-Agent": "tvt-camera-info/1.2",
+        }
+        auth = None
+        if attempt == 1:
+            scheme = _auth_scheme_from_challenge(last_challenge)
+            dbg(f"ONVIF challenge(s)={_redact(last_challenge)!r} → retrying with {scheme}")
+            if scheme == "digest":
+                mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+                mgr.add_password(None, url, user, password)
+                opener = urllib.request.build_opener(
+                    urllib.request.HTTPDigestAuthHandler(mgr))
+                req = urllib.request.Request(url, data=envelope().encode("utf-8"),
+                                             method="POST", headers=headers)
+                try:
+                    with opener.open(req, timeout=timeout) as resp:
+                        return resp.read().decode("utf-8", errors="replace")
+                except urllib.error.HTTPError as e:
+                    raise HttpAuthChallenge(
+                        e.headers.get("WWW-Authenticate", "") if e.headers else "") from None
+                except (socket.timeout, TimeoutError):
+                    raise RouteError("connection timed out") from None
+                except (ConnectionError, OSError) as e:
+                    raise RouteError(f"could not connect ({e})") from None
+            auth = _basic_auth_header(user, password)
+            headers["Authorization"] = auth
+        req = urllib.request.Request(url, data=envelope().encode("utf-8"),
+                                     method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                challenge = e.headers.get("WWW-Authenticate", "") if e.headers else ""
+                if attempt == 0:
+                    last_challenge = challenge
+                    dbg(f"ONVIF probe ← 401 WWW-Auth={_redact(challenge)!r}")
+                    continue
+                raise HttpAuthChallenge(challenge) from None
+            if e.code in (400, 403):
+                raise AuthError(f"camera rejected the request (HTTP {e.code})") from None
+            raise UnexpectedError(f"camera answered HTTP {e.code}") from None
+        except (socket.timeout, TimeoutError):
+            raise RouteError("connection timed out") from None
+        except (ConnectionError, OSError) as e:
+            raise RouteError(f"could not connect ({e})") from None
+    raise UnexpectedError("unreachable")  # pragma: no cover
 
 
 def xml_text(xml: str, tag: str) -> "str | None":
@@ -858,12 +902,12 @@ def _run_proto(proto: str, ip: str, port: int, user: str, password: str,
         elif proto == "xml":
             info = provision_xml_query(ip, port or DVRIP_HTTP_PORT, user, password, timeout)
         else:
-            # ONVIF may live on 8899 (legacy default) or be served by the
-            # main web service on port 80 (common on modern TVT IPC firmware
-            # that advertises onvifVer). Try both before giving up.
+            # ONVIF is usually served by the main web service on port 80 on
+            # modern TVT IPC firmware that advertises onvifVer; 8899 is the
+            # legacy standalone service. Try 80 first, then 8899.
             candidates = [(port or ONVIF_PORT, ONVIF_PATH)]
             if (port or ONVIF_PORT) != DVRIP_HTTP_PORT:
-                candidates.append((DVRIP_HTTP_PORT, ONVIF_PATH))
+                candidates.insert(0, (DVRIP_HTTP_PORT, ONVIF_PATH))
             last_exc: "Exception | None" = None
             for onvif_port, onvif_path in candidates:
                 base = f"http://{ip}:{onvif_port}{onvif_path}"
@@ -902,7 +946,7 @@ def main() -> None:
     p.add_argument("--proto", default="auto",
                    choices=["auto", "http", "xml", "tcp", "onvif"],
                    help="which protocol(s) to try: auto tries tcp → http → xml → "
-                        "onvif (default: auto)")
+                        "onvif 80/8899 (default: auto)")
     p.add_argument("--timeout", type=float, default=TIMEOUT_DEFAULT,
                    help="network timeout in seconds (default: 8)")
     p.add_argument("--no-ping", action="store_true",

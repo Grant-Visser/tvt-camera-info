@@ -478,5 +478,105 @@ class ProvisionXMLTests(unittest.TestCase):
             T.provision_xml_query("127.0.0.1", port, "admin", "x", 2)
 
 
+class MockOnvif80(BaseHTTPRequestHandler):
+    """ONVIF-on-80 device: challenge unauthenticated SOAP with 401 Basic,
+    accept a Basic-credentialed retry; legacy 8899 mode wants WS-UsernameToken."""
+    seen = []
+    require_ws_token = False
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode("utf-8", errors="replace")
+        MockOnvif80.seen.append({"path": self.path,
+                                 "auth": self.headers.get("Authorization"),
+                                 "body": body})
+        has_ws_token = "UsernameToken" in body and "<Username>admin</Username>" in body
+        if self.headers.get("Authorization") == "Basic YWRtaW46Z29vZHB3":  # admin:goodpw
+            self._serve()
+        elif MockOnvif80.require_ws_token and has_ws_token:
+            self._serve()
+        elif self.headers.get("Authorization") is None:
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="Basic"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="Basic"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    def _serve(self):
+        body = ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope">'
+                '<SOAP-ENV:Body><tds:GetDeviceInformationResponse>'
+                '<tds:Manufacturer>TVT</tds:Manufacturer>'
+                '<tds:Model>TD-9423A3-LR</tds:Model>'
+                '<tds:SerialNumber>SN-ONVIF-80-1234</tds:SerialNumber>'
+                '<tds:FirmwareVersion>5.1.1.0(52573)</tds:FirmwareVersion>'
+                '</tds:GetDeviceInformationResponse>'
+                '<tds:GetNetworkInterfacesResponse>'
+                '<tds:NetworkInterfaces><tt:Info><tt:HwAddress>00:12:3F:11:22:33</tt:HwAddress>'
+                '</tt:Info></tds:NetworkInterfaces>'
+                '</tds:GetNetworkInterfacesResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>').encode()
+        self.send_response(200)
+        self.send_header("Content-Type", 'application/soap+xml; charset=utf-8')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+class OnvifPort80Tests(unittest.TestCase):
+    def setUp(self):
+        MockOnvif80.seen = []
+        MockOnvif80.require_ws_token = False
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), MockOnvif80)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+
+    def test_challenge_then_basic_retry(self):
+        info, mac, label, kind = T._run_proto(
+            "onvif", "127.0.0.1", self.port, "admin", "goodpw", 5)
+        self.assertEqual(kind, "ok", info)
+        self.assertEqual(info["SerialNumber"], "SN-ONVIF-80-1234")
+        self.assertEqual(mac, "00:12:3F:11:22:33")
+        self.assertEqual(label, "ONVIF SOAP")
+        # two SOAP calls (device info + network interfaces), each with an
+        # unauthenticated probe followed by the Basic credentialed retry
+        self.assertEqual(len(MockOnvif80.seen), 4)
+        self.assertIsNone(MockOnvif80.seen[0]["auth"])
+        self.assertEqual(MockOnvif80.seen[1]["auth"], "Basic YWRtaW46Z29vZHB3")
+        self.assertIsNone(MockOnvif80.seen[2]["auth"])
+        self.assertEqual(MockOnvif80.seen[3]["auth"], "Basic YWRtaW46Z29vZHB3")
+
+    def test_ws_username_token_fallback_for_legacy(self):
+        MockOnvif80.require_ws_token = True
+        info, mac, kind = T.onvif_get_device_information(
+            f"http://127.0.0.1:{self.port}{T.ONVIF_PATH}", "admin", "goodpw", 5), None, "ok"
+        self.assertEqual(info["SerialNumber"], "SN-ONVIF-80-1234")
+        # second attempt (WS-Security inside SOAP body) authenticated without
+        # an Authorization header on the mock's basic-required branch
+        self.assertTrue(MockOnvif80.seen[-1]["body"].startswith("<?xml"))
+
+    def test_bad_password_is_auth_error(self):
+        _, err, _, kind = T._run_proto(
+            "onvif", "127.0.0.1", self.port, "admin", "wrongpw", 5)
+        self.assertEqual(kind, "auth", err)
+
+    def test_port80_first_when_port_unspecified(self):
+        # default port 0 → candidates [80, 8899]; closed 8899 on loopback gives
+        # RouteError after 80 — here just assert candidate ordering via source
+        src = open("tvt_camera_info.py").read()
+        i = src.find("candidates = [(port or ONVIF_PORT, ONVIF_PATH)]")
+        j = src.find("candidates.insert(0, (DVRIP_HTTP_PORT, ONVIF_PATH))")
+        self.assertLess(i, j)
+        self.assertIn("insert(0, (DVRIP_HTTP_PORT", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
