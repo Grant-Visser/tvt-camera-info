@@ -745,6 +745,10 @@ def _dvrip_http_attempt(url: str, user: str, password: str, timeout: float,
 
 # ── ONVIF SOAP (legacy 8899 / port 80, last resort) ──────────────────────────
 
+SOAP_DEVINFO_ACTION = (
+    "http://www.onvif.org/ver10/device/wsdl/GetDeviceInformation")
+
+
 def soap_request(url: str, user: str, password: str, body: str,
                  timeout: float) -> str:
     """
@@ -768,55 +772,73 @@ def soap_request(url: str, user: str, password: str, body: str,
   <s:Body>{body}</s:Body>
 </s:Envelope>"""
     last_challenge = ""
-    for attempt in range(2):
-        headers = {
-            "Content-Type": 'application/soap+xml; charset=utf-8; '
-                            'action="http://www.onvif.org/ver10/device/wsdl/GetDeviceInformation"',
-            "User-Agent": "tvt-camera-info/1.2",
-        }
-        auth = None
-        if attempt == 1:
-            scheme = _auth_scheme_from_challenge(last_challenge)
-            dbg(f"ONVIF challenge(s)={_redact(last_challenge)!r} → retrying with {scheme}")
-            if scheme == "digest":
-                mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
-                mgr.add_password(None, url, user, password)
-                opener = urllib.request.build_opener(
-                    urllib.request.HTTPDigestAuthHandler(mgr))
-                req = urllib.request.Request(url, data=envelope().encode("utf-8"),
-                                             method="POST", headers=headers)
-                try:
-                    with opener.open(req, timeout=timeout) as resp:
-                        return resp.read().decode("utf-8", errors="replace")
-                except urllib.error.HTTPError as e:
-                    raise HttpAuthChallenge(
-                        e.headers.get("WWW-Authenticate", "") if e.headers else "") from None
-                except (socket.timeout, TimeoutError):
-                    raise RouteError("connection timed out") from None
-                except (ConnectionError, OSError) as e:
-                    raise RouteError(f"could not connect ({e})") from None
-            auth = _basic_auth_header(user, password)
-            headers["Authorization"] = auth
-        req = urllib.request.Request(url, data=envelope().encode("utf-8"),
-                                     method="POST", headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as e:
-            if e.code == 401:
-                challenge = e.headers.get("WWW-Authenticate", "") if e.headers else ""
-                if attempt == 0:
-                    last_challenge = challenge
-                    dbg(f"ONVIF probe ← 401 WWW-Auth={_redact(challenge)!r}")
-                    continue
-                raise HttpAuthChallenge(challenge) from None
-            if e.code in (400, 403):
-                raise AuthError(f"camera rejected the request (HTTP {e.code})") from None
-            raise UnexpectedError(f"camera answered HTTP {e.code}") from None
-        except (socket.timeout, TimeoutError):
-            raise RouteError("connection timed out") from None
-        except (ConnectionError, OSError) as e:
-            raise RouteError(f"could not connect ({e})") from None
+    # The camera answered HTTP 400 on the SOAP 1.2 request (run 2026-11-11,
+    # TD-9423A3-LR): parsed-and-rejected, so this firmware may only accept the
+    # older SOAP 1.1 envelope binding. Retry 1.1 whenever 1.2 is rejected with
+    # 400/403/415 and log every rejection body — the body names the problem.
+    for soap_ver in ("1.2", "1.1"):
+        for attempt in range(2):
+            if soap_ver == "1.2":
+                mt = "application/soap+xml"
+                headers = {"Content-Type": mt + '; charset=utf-8; action="'
+                           + SOAP_DEVINFO_ACTION + '"'}
+            else:
+                mt = "text/xml"
+                headers = {"Content-Type": mt + "; charset=utf-8",
+                           "SOAPAction": SOAP_DEVINFO_ACTION}
+            headers["User-Agent"] = "tvt-camera-info/1.2"
+            if attempt == 1:
+                scheme = _auth_scheme_from_challenge(last_challenge)
+                dbg(f"ONVIF challenge(s)={_redact(last_challenge)!r} → retrying with {scheme}")
+                if scheme == "digest":
+                    mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+                    mgr.add_password(None, url, user, password)
+                    opener = urllib.request.build_opener(
+                        urllib.request.HTTPDigestAuthHandler(mgr))
+                    req = urllib.request.Request(url, data=envelope().encode("utf-8"),
+                                                 method="POST", headers=headers)
+                    try:
+                        with opener.open(req, timeout=timeout) as resp:
+                            return resp.read().decode("utf-8", errors="replace")
+                    except urllib.error.HTTPError as e:
+                        raise HttpAuthChallenge(
+                            e.headers.get("WWW-Authenticate", "") if e.headers else "") from None
+                    except (socket.timeout, TimeoutError):
+                        raise RouteError("connection timed out") from None
+                    except (ConnectionError, OSError) as e:
+                        raise RouteError(f"could not connect ({e})") from None
+                headers["Authorization"] = _basic_auth_header(user, password)
+            req = urllib.request.Request(url, data=envelope().encode("utf-8"),
+                                         method="POST", headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return resp.read().decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as e:
+                dbg(f"ONVIF ← HTTP {e.code} ({mt})")
+                if e.headers is not None:
+                    try:
+                        rbody = e.read(2048).decode("utf-8", errors="replace")
+                    except Exception:
+                        rbody = ""
+                    if rbody.strip():
+                        dbg(f"ONVIF HTTP {e.code} body: {rbody[:512]!r}")
+                if e.code == 401:
+                    challenge = e.headers.get("WWW-Authenticate", "") if e.headers else ""
+                    if attempt == 0:
+                        last_challenge = challenge
+                        dbg(f"ONVIF probe ← 401 WWW-Auth={_redact(challenge)!r}")
+                        continue
+                    raise HttpAuthChallenge(challenge) from None
+                if e.code in (400, 403, 415) and attempt == 0 and soap_ver == "1.2":
+                    dbg("ONVIF SOAP 1.2 rejected → retrying with SOAP 1.1 binding")
+                    break  # advance to the SOAP 1.1 envelope
+                if e.code in (400, 403):
+                    raise AuthError(f"camera rejected the request (HTTP {e.code})") from None
+                raise UnexpectedError(f"camera answered HTTP {e.code}") from None
+            except (socket.timeout, TimeoutError):
+                raise RouteError("connection timed out") from None
+            except (ConnectionError, OSError) as e:
+                raise RouteError(f"could not connect ({e})") from None
     raise UnexpectedError("unreachable")  # pragma: no cover
 
 

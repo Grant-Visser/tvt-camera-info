@@ -528,6 +528,72 @@ class MockOnvif80(BaseHTTPRequestHandler):
         pass
 
 
+class MockSoap11Only(BaseHTTPRequestHandler):
+    """Firmware that 400-rejects SOAP 1.2 but serves ONVIF over SOAP 1.1
+    with Basic auth — the 2026-11-11 TD-9423A3-LR behaviour."""
+    seen = []
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)
+        ct = self.headers.get("Content-Type", "")
+        MockSoap11Only.seen.append(
+            {"ct": ct, "auth": self.headers.get("Authorization"),
+             "soapaction": self.headers.get("SOAPAction")})
+        if ct.startswith("application/soap+xml"):
+            self.send_response(400)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.headers.get("Authorization") == "Basic YWRtaW46Z29vZHB3":
+            body = ('<?xml version="1.0" encoding="UTF-8"?>'
+                    '<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/">'
+                    '<SOAP-ENV:Body><tds:GetDeviceInformationResponse '
+                    'xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
+                    '<tds:SerialNumber>SN-SOAP11-5678</tds:SerialNumber>'
+                    '</tds:GetDeviceInformationResponse></SOAP-ENV:Body>'
+                    '</SOAP-ENV:Envelope>').encode()
+            self.send_response(200)
+            self.send_header("Content-Type", 'text/xml; charset=utf-8')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="Basic"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    def log_message(self, *a):
+        pass
+
+
+class Soap11FallbackTests(unittest.TestCase):
+    def setUp(self):
+        MockSoap11Only.seen = []
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), MockSoap11Only)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+
+    def test_soap12_rejection_falls_back_to_soap11(self):
+        info, mac, label, kind = T._run_proto(
+            "onvif", "127.0.0.1", self.port, "admin", "goodpw", 5)
+        self.assertEqual(kind, "ok", info)
+        self.assertEqual(info["SerialNumber"], "SN-SOAP11-5678")
+        # two SOAP calls (device info + network interfaces), each doing:
+        # SOAP 1.2 probe → 400; SOAP 1.1 probe → 401; SOAP 1.1 + Basic → 200
+        self.assertEqual(len(MockSoap11Only.seen), 6)
+        self.assertTrue(MockSoap11Only.seen[0]["ct"].startswith("application/soap+xml"))
+        self.assertTrue(MockSoap11Only.seen[1]["ct"].startswith("text/xml"))
+        self.assertIsNone(MockSoap11Only.seen[1]["auth"])
+        self.assertEqual(MockSoap11Only.seen[2]["auth"], "Basic YWRtaW46Z29vZHB3")
+        self.assertEqual(MockSoap11Only.seen[1]["soapaction"],
+                         T.SOAP_DEVINFO_ACTION)
+
+
 class OnvifPort80Tests(unittest.TestCase):
     def setUp(self):
         MockOnvif80.seen = []
