@@ -882,12 +882,19 @@ PROTO_NAMES = {"tcp": "DVRIP over TCP", "http": "DVRIP over HTTP",
 
 
 def _run_proto(proto: str, ip: str, port: int, user: str, password: str,
-               timeout: float) -> "tuple[dict | None, str, str, str]":
+               timeout: float, onvif_user: str = None, onvif_password: str = None
+               ) -> "tuple[dict | None, str, str, str]":
     """
     Attempt one protocol.
     Returns (info, mac, transport_label, ok) on success, or
     (None, err, label, kind) on failure, where kind ∈ {auth, route, error}.
+    onvif_user/onvif_password override user/password for the ONVIF transport
+    only (some cameras have a dedicated ONVIF account).
     """
+    if onvif_user is None:
+        onvif_user = user
+    if onvif_password is None:
+        onvif_password = password
     label = PROTO_NAMES[proto]
     try:
         if proto == "tcp":
@@ -907,9 +914,9 @@ def _run_proto(proto: str, ip: str, port: int, user: str, password: str,
             for onvif_port, onvif_path in candidates:
                 base = f"http://{ip}:{onvif_port}{onvif_path}"
                 try:
-                    dbg(f"ONVIF attempt: {base}")
-                    return onvif_get_device_information(base, user, password, timeout), \
-                        onvif_get_network_interfaces(base, user, password, timeout), \
+                    dbg(f"ONVIF attempt: {base} (user={onvif_user})")
+                    return onvif_get_device_information(base, onvif_user, onvif_password, timeout), \
+                        onvif_get_network_interfaces(base, onvif_user, onvif_password, timeout), \
                         label, "ok"
                 except (AuthError, RouteError, UnexpectedError) as e:
                     last_exc = e
@@ -935,6 +942,11 @@ def main() -> None:
     p.add_argument("--ip", required=True, help="camera IP address, e.g. 192.168.1.64")
     p.add_argument("--user", default="admin", help="camera username (default: admin)")
     p.add_argument("--password", default="", help="camera password")
+    p.add_argument("--onvif-user", default=None,
+                   help="username for ONVIF only, if the camera has a separate "
+                        "ONVIF account (defaults to --user)")
+    p.add_argument("--onvif-password", default=None,
+                   help="password for ONVIF only (defaults to --password)")
     p.add_argument("--port", type=int, default=0,
                    help="override the port for the active transport "
                         "(defaults: tcp=34567, http/xml=80, onvif=8899)")
@@ -990,8 +1002,10 @@ def main() -> None:
     held_info = held_mac = held_label = None
     for proto in order:
         print(f"  trying {PROTO_NAMES[proto]}...", flush=True)
-        info, mac, label, kind = _run_proto(proto, args.ip, args.port, args.user,
-                                            args.password, args.timeout)
+        info, mac, label, kind = _run_proto(proto, args.ip, args.port,
+                                            args.user, args.password, args.timeout,
+                                            onvif_user=args.onvif_user or args.user,
+                                            onvif_password=args.onvif_password or args.password)
         if info and any(k.lower() == "serialnumber" for k in info):
             print(f"  ✓ {label} answered\n")
             break
